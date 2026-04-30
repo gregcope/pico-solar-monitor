@@ -13,16 +13,27 @@ try:
 except ImportError:
     from umqtt.simple import MQTTClient
 
-appVersion = "4.0.0" # Modular Object-Oriented Refactor
+appVersion = "4.0.2" # Refactored variables and comments to be sensor-agnostic
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-clientId = "solar_monitor"
-sensorInterval = 5 
-heartbeatInterval = 60 
-tempChangeThreshold = 0.3 
 
+# The unique name this device uses to identify itself to the MQTT broker
+# NEEDS TO BE CHANGED if you are reusing this code for another sensor
+clientId = "solar_monitor"
+
+# How often (in seconds) the Pico reads the physical sensors
+sensorInterval = 5 
+
+# How often (in seconds) to force a network publish, even if readings are flat
+heartbeatInterval = 60 
+
+# The minimum reading change needed to trigger an immediate publish
+sensorChangeThreshold = 0.3 
+
+
+# --- System Internals (Do not modify) ---
 systemStartTime = time.time()
 watchdog = machine.WDT(timeout=8000)
 onboardLed = machine.Pin("LED", machine.Pin.OUT, value=1)
@@ -61,7 +72,7 @@ class SensorManager:
                 val = round(self.dsSensor.read_temp(rom), 1)
                 
                 if val != 85.0 and val != -127.0:
-                    if abs(val - s['lastTemp']) >= tempChangeThreshold or force_publish:
+                    if abs(val - s['lastTemp']) >= sensorChangeThreshold or force_publish:
                         updates.append({
                             'id': s['sensorId'],
                             'topic': f"homeassistant/sensor/{s['sensorId']}/state",
