@@ -13,7 +13,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTClient
 
-app_version = "5.5.0" # Added internal CPU temperature monitoring
+app_version = "5.6.5" 
 
 # ==========================================
 # 1. CONFIGURATION
@@ -30,6 +30,11 @@ sensor_change_threshold_c = 0.3
 watchdog_timeout_ms = 8000 
 sensor_conversion_delay_ms = 750
 mqtt_keepalive_grace_secs = 20
+
+# Backoff Networking Timing
+initial_backoff_secs = 1.0
+max_backoff_secs = 60.0
+max_failed_attempts = 20
 
 # --- System Internals ---
 system_start_time_secs = time.time()
@@ -51,8 +56,6 @@ def get_reset_cause() -> str:
     return "Unknown"
 
 last_reset_reason = get_reset_cause()
-print(f"--- SYSTEM START (v{app_version}) ---")
-print(f"--- Last Reset Cause: {last_reset_reason} ---")
 
 for i in range(10, 0, -1):
     onboard_led.toggle()
@@ -78,6 +81,7 @@ class SensorManager:
             })
 
     def start_conversion(self) -> bool:
+        global system_status
         try:
             self.roms_cache = self.ds_sensor.scan()
             if not self.roms_cache: return False
@@ -85,19 +89,25 @@ class SensorManager:
             self.is_converting = True
             self.conversion_start_time_ms = time.ticks_ms()
             return True
-        except onewire.OneWireError:
+        except (onewire.OneWireError, OSError):
             self.is_converting = False
+            system_status = "1-Wire Bus Error"
             return False
 
     def read_and_evaluate(self, force_publish: bool = False) -> list:
+        global system_status
         updates = []
         self.is_converting = False 
+        bus_fault_detected = False
         try:
             for idx, s in enumerate(self.sensors):
                 temp_c = None
                 if idx < len(self.roms_cache):
-                    t = self.ds_sensor.read_temp(self.roms_cache[idx])
-                    if t != 85.0 and t != -127.0: temp_c = t
+                    try:
+                        t = self.ds_sensor.read_temp(self.roms_cache[idx])
+                        if t != 85.0 and t != -127.0: temp_c = t
+                    except (onewire.OneWireError, OSError):
+                        bus_fault_detected = True
                 
                 if temp_c is not None:
                     s['fail_count'] = 0
@@ -121,7 +131,14 @@ class SensorManager:
                     if force_publish or abs(final_temp_to_evaluate_c - s['last_temp_c']) >= sensor_change_threshold_c:
                         updates.append({'topic': f"homeassistant/sensor/{s['sensor_id']}/state", 'payload': {"temperature": final_temp_to_evaluate_c}})
                         s['last_temp_c'] = final_temp_to_evaluate_c
-        except Exception: pass
+                        
+            if system_status in ("Sensor Bus Exception", "1-Wire Bus Error") and not bus_fault_detected:
+                system_status = "Healthy"
+                
+        except (onewire.OneWireError, OSError): 
+            system_status = "Sensor Bus Exception"
+        except Exception: 
+            system_status = "Sensor Evaluation Error"
         return updates
 
 # ==========================================
@@ -136,6 +153,7 @@ class NetworkManager:
         self.client = None
         self.failed_attempts = 0
         self.reconnects = 0
+        self.current_backoff = initial_backoff_secs
         self.master_avail_topic = f"homeassistant/sensor/{self.client_id}/availability"
 
     def maintain_connection(self) -> bool:
@@ -148,7 +166,6 @@ class NetworkManager:
 
         system_status = "Connecting"
         if not wlan.isconnected():
-            print("WiFi: Connecting...")
             wlan.connect(secrets.wifiSsid, secrets.wifiPassword)
             for _ in range(10):
                 if wlan.isconnected(): break
@@ -177,18 +194,24 @@ class NetworkManager:
                 
                 self.reconnects += 1
                 self.failed_attempts = 0 
+                self.current_backoff = initial_backoff_secs
                 system_status = "Healthy"
-                print("--- NETWORK CONNECTED ---")
                 return True
             except OSError:
                 self.client = None
                 
         self.failed_attempts += 1
-        system_status = f"Network Error ({self.failed_attempts}/200)"
-        print(f" ! Connection failure {self.failed_attempts}/200")
+        system_status = f"Network Error ({self.failed_attempts}/{max_failed_attempts})"
         
-        if self.failed_attempts >= 200:
-            print(" ! Resetting due to persistent network failure.")
+        # Exponential backoff loop feeding watchdog
+        sleep_steps = int(self.current_backoff)
+        for _ in range(max(1, sleep_steps)):
+            watchdog.feed()
+            time.sleep(1)
+            
+        self.current_backoff = min(self.current_backoff * 2.0, max_backoff_secs)
+        
+        if self.failed_attempts >= max_failed_attempts:
             machine.reset() 
             
         return False
@@ -304,7 +327,6 @@ while True:
         network_controller.publish(f"homeassistant/sensor/{client_id}_sys/state", sys_data)
         last_published_status = system_status
         if force_heartbeat:
-            print(f"--> System Heartbeat Sent. Status: {system_status}")
             force_sensor_publish = True 
             last_heartbeat_time_secs = now_secs
 
@@ -313,7 +335,6 @@ while True:
         bus_active = sensors_manager.start_conversion()
         if not bus_active:
             system_status = "1-Wire Bus Error"
-            print(" ! Warning: 1-Wire bus communication failure. Check hardware connections.")
             for s in sensors_manager.sensors:
                 if s['last_avail'] != 'offline':
                     network_controller.publish(f"homeassistant/sensor/{s['sensor_id']}/availability", "offline")
