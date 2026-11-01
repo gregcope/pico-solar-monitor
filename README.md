@@ -1,4 +1,4 @@
-# Wall Solar Monitor
+# Wall Solar Monitor:100000
 
 MicroPython firmware designed for a Raspberry Pi Pico 2 W to track the performance and thermal characteristics of a home solar panel array via MQTT and Home Assistant auto-discovery. This document serves as both a human-readable guide and a precise execution specification for GenAI software engineering agents.
 
@@ -163,3 +163,5 @@ The codebase adheres to strict MicroPython design standards:
 * **v5.6.6:** Bump version for upgrade testing
 * **v5.6.7:** Bump version for upgrade testing from github
 * **v5.6.8:** Fix MQTT sensor names
+* **v5.6.9:** Post typo fix firmware test
+* **v5.6.10:** Okay... not going to plan
