@@ -162,3 +162,4 @@ The codebase adheres to strict MicroPython design standards:
 * **v5.6.5:** Stabilized headless resilience with global system status strings, 8-second hardware watchdog timer, and network backoff logic.
 * **v5.6.6:** Bump version for upgrade testing
 * **v5.6.7:** Bump version for upgrade testing from github
+* **v5.6.8:** Fix MQTT sensor names
