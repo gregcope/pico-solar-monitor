@@ -1,19 +1,21 @@
-import machine
-import time
-import network
+import asyncio
 import json
-import gc
+import os
+import time
+import machine
+import network
+import secrets
+import ugit
 import onewire
 import ds18x20
 from ubinascii import hexlify
-import secrets
 
 try:
     from simple import MQTTClient
 except ImportError:
-    from umqtt.simple import MQTTClient
+    from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.6" 
+app_version = "5.6.8"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -28,38 +30,52 @@ sensor_change_threshold_c = 0.3
 
 # Hardware and Network Timing
 watchdog_timeout_ms = 8000 
-sensor_conversion_delay_ms = 750
 mqtt_keepalive_grace_secs = 20
-
-# Backoff Networking Timing
 initial_backoff_secs = 1.0
 max_backoff_secs = 60.0
 max_failed_attempts = 20
 
 # --- System Internals ---
 system_start_time_secs = time.time()
-watchdog = machine.WDT(timeout=watchdog_timeout_ms) 
+watchdog = None
 onboard_led = machine.Pin("LED", machine.Pin.OUT, value=1)
-
-# Connect to the Pico's internal temperature sensor (ADC channel 4)
 internal_temp_sensor = machine.ADC(4)
+device_serial = hexlify(machine.unique_id()).decode()
 
 system_status = "Initializing"
 last_published_status = ""
 force_sensor_publish = False 
 
+
+class SensorReadError(Exception):
+    """Raised when an individual 1-Wire sensor read fails."""
+    pass
+
+
 def get_reset_cause() -> str:
+    """Determine the reset cause, prioritizing OTA firmware updates."""
+    try:
+        with open("/ugit_log.txt", "r") as log_file:
+            log_data = log_file.read()
+        if "/main.py updated" in log_data:
+            os.remove("/ugit_log.txt")
+            return "Firmware Upgrade"
+    except OSError:
+        pass
+
     cause = machine.reset_cause()
     if cause == machine.PWRON_RESET: return "Power On"
     if cause == machine.WDT_RESET: return "Watchdog Timer"
     if cause == machine.SOFT_RESET: return "Software Reset"
     return "Unknown"
 
+
 last_reset_reason = get_reset_cause()
 
 for i in range(10, 0, -1):
     onboard_led.toggle()
     time.sleep(0.2)
+
 
 # ==========================================
 # 2. THE SENSOR LIBRARY (Median Filtering)
@@ -69,8 +85,6 @@ class SensorManager:
         self.data_pin = machine.Pin(data_pin_num)
         self.ds_bus = onewire.OneWire(self.data_pin)
         self.ds_sensor = ds18x20.DS18X20(self.ds_bus)
-        self.is_converting = False
-        self.conversion_start_time_ms = 0
         self.roms_cache = []
         self.sensors = []
         for name in sensor_list:
@@ -81,23 +95,20 @@ class SensorManager:
             })
 
     def start_conversion(self) -> bool:
+        """Starts a temperature conversion for all devices on the bus."""
         global system_status
         try:
             self.roms_cache = self.ds_sensor.scan()
             if not self.roms_cache: return False
             self.ds_sensor.convert_temp()
-            self.is_converting = True
-            self.conversion_start_time_ms = time.ticks_ms()
             return True
         except (onewire.OneWireError, OSError):
-            self.is_converting = False
             system_status = "1-Wire Bus Error"
             return False
 
     def read_and_evaluate(self, force_publish: bool = False) -> list:
         global system_status
         updates = []
-        self.is_converting = False 
         bus_fault_detected = False
         try:
             for idx, s in enumerate(self.sensors):
@@ -141,11 +152,16 @@ class SensorManager:
             system_status = "Sensor Evaluation Error"
         return updates
 
+
 # ==========================================
-# 3. THE NETWORK LIBRARY
+# 3. THE NETWORK MANAGER
 # ==========================================
 class NetworkManager:
-    def __init__(self, client_id: str, broker: str, user: str, password: str) -> None:
+    """Manages WiFi connectivity, MQTT communication, exponential backoff, and discovery payloads."""
+
+    def __init__(
+        self, client_id: str, broker: str, user: str, password: str
+    ) -> None:
         self.client_id = client_id
         self.broker = broker
         self.user = user
@@ -154,13 +170,20 @@ class NetworkManager:
         self.failed_attempts = 0
         self.reconnects = 0
         self.current_backoff = initial_backoff_secs
-        self.master_avail_topic = f"homeassistant/sensor/{self.client_id}/availability"
 
-    def maintain_connection(self) -> bool:
+        self.master_avail_topic = (
+            f"homeassistant/sensor/{self.client_id}/availability"
+        )
+        self.ota_cmd_topic = (
+            f"homeassistant/button/{self.client_id}_ota/set"
+        )
+
+    async def maintain_connection(self) -> bool:
+        """Maintain robust network and MQTT connectivity using exponential backoff."""
         global system_status
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
-        
+
         if wlan.isconnected() and self.client is not None:
             return True
 
@@ -168,76 +191,124 @@ class NetworkManager:
         if not wlan.isconnected():
             wlan.connect(secrets.wifiSsid, secrets.wifiPassword)
             for _ in range(10):
-                if wlan.isconnected(): break
-                watchdog.feed()
-                time.sleep(1)
+                if wlan.isconnected():
+                    break
+                if watchdog is not None:
+                    watchdog.feed()
+                await asyncio.sleep(1)
 
         if wlan.isconnected():
             try:
-                unique_id = self.client_id + "_" + hexlify(machine.unique_id()).decode()
+                unique_id = self.client_id + "_" + device_serial
                 self.client = MQTTClient(
-                    unique_id, 
-                    self.broker, 
-                    user=self.user, 
-                    password=self.password, 
-                    keepalive=heartbeat_interval_secs + mqtt_keepalive_grace_secs
+                    unique_id,
+                    self.broker,
+                    user=self.user,
+                    password=self.password,
+                    keepalive=heartbeat_interval_secs
+                    + mqtt_keepalive_grace_secs,
                 )
-                
-                # Register the Last Will and Testament BEFORE connecting
-                lwt_topic_bytes = self.master_avail_topic.encode('utf-8')
-                self.client.set_last_will(lwt_topic_bytes, b"offline", retain=True)
-                
+
+                lwt_topic_bytes = self.master_avail_topic.encode("utf-8")
+                self.client.set_last_will(
+                    lwt_topic_bytes, b"offline", retain=True
+                )
+
                 self.client.connect()
-                
-                # Immediately announce the device is online
                 self.publish(self.master_avail_topic, "online", retain=True)
-                
+
+                # --- OTA Validation Handshake ---
+                try:
+                    os.remove("ota_pending.flag")
+                except OSError:
+                    pass
+
                 self.reconnects += 1
-                self.failed_attempts = 0 
+                self.failed_attempts = 0
                 self.current_backoff = initial_backoff_secs
                 system_status = "Healthy"
                 return True
-            except OSError:
+            except (OSError, MQTTException):
                 self.client = None
-                
+
         self.failed_attempts += 1
-        system_status = f"Network Error ({self.failed_attempts}/{max_failed_attempts})"
-        
-        # Exponential backoff loop feeding watchdog
+        system_status = (
+            f"Network Error ({self.failed_attempts}/{max_failed_attempts})"
+        )
+
         sleep_steps = int(self.current_backoff)
         for _ in range(max(1, sleep_steps)):
-            watchdog.feed()
-            time.sleep(1)
-            
-        self.current_backoff = min(self.current_backoff * 2.0, max_backoff_secs)
-        
+            if watchdog is not None:
+                watchdog.feed()
+            await asyncio.sleep(1)
+
+        self.current_backoff = min(
+            self.current_backoff * 2.0, max_backoff_secs
+        )
+
         if self.failed_attempts >= max_failed_attempts:
-            machine.reset() 
-            
+            machine.reset()
+
         return False
 
-    def publish(self, topic: str, payload_data, retain: bool = True) -> bool:
-        if self.client is None: return False
+    def publish(
+        self, topic: str, payload_data, retain: bool = True
+    ) -> bool:
+        """Publish data payload to specified MQTT topic."""
+        if self.client is None:
+            return False
         try:
-            t_bytes = topic.encode('utf-8')
-            p_bytes = json.dumps(payload_data).encode('utf-8') if isinstance(payload_data, dict) else str(payload_data).encode('utf-8')
+            t_bytes = topic.encode("utf-8")
+            p_bytes = (
+                json.dumps(payload_data).encode("utf-8")
+                if isinstance(payload_data, dict)
+                else str(payload_data).encode("utf-8")
+            )
             self.client.publish(t_bytes, p_bytes, retain=retain)
             return True
-        except OSError:
+        except (OSError, MQTTException):
             self.client = None
             return False
 
     def check_messages(self) -> None:
+        """Check for incoming MQTT messages."""
         if self.client:
-            try: self.client.check_msg()
-            except OSError: self.client = None
+            try:
+                self.client.check_msg()
+            except (OSError, MQTTException):
+                self.client = None
 
     def send_discovery(self, sensors_list: list) -> bool:
+        """Send Home Assistant MQTT discovery configuration."""
         try:
+            device_info = {
+                "identifiers": [self.client_id, device_serial],
+                "name": "Wall Solar Monitor",
+                "model": "Raspberry Pi Pico 2 W",
+                "sw_version": app_version,
+                "serial_number": device_serial,
+            }
+
+            # Register OTA Update Button
+            ota_config_topic = (
+                f"homeassistant/button/{self.client_id}_ota/config"
+            )
+            ota_payload = {
+                "name": "Update Firmware",
+                "unique_id": f"{self.client_id}_ota",
+                "command_topic": self.ota_cmd_topic,
+                "device_class": "update",
+                "availability_topic": self.master_avail_topic,
+                "device": device_info,
+            }
+            self.publish(ota_config_topic, ota_payload)
+            time.sleep(0.1)
+
             for s in sensors_list:
                 topic = f"homeassistant/sensor/{s['sensor_id']}_T/config"
                 payload = {
-                    "name": f"{s['sensor_name']} Temp", "unique_id": f"{s['sensor_id']}_T", 
+                    "name": f"{s['sensor_name']} Temp", 
+                    "unique_id": f"{s['sensor_id']}_T", 
                     "state_topic": f"homeassistant/sensor/{s['sensor_id']}/state",
                     "availability": [
                         {"topic": self.master_avail_topic},
@@ -247,12 +318,11 @@ class NetworkManager:
                     "unit_of_measurement": "°C", "device_class": "temperature",
                     "state_class": "measurement", 
                     "value_template": "{{ value_json.temperature }}",
-                    "device": {"identifiers": [self.client_id], "name": "Wall Solar Monitor"}
+                    "device": device_info
                 }
                 self.publish(topic, payload)
                 time.sleep(0.1)
             
-            # Included pico_temp in the diagnostics list
             sys_sensors = [("pico_temp", "Internal CPU Temp", "temperature", "°C", "measurement"),
                            ("rssi", "Signal Strength", "signal_strength", "dBm", "measurement"), 
                            ("uptime", "Uptime", "duration", "s", None),
@@ -264,95 +334,241 @@ class NetworkManager:
             for key, name, d_class, unit, s_class in sys_sensors:
                 topic = f"homeassistant/sensor/{self.client_id}_{key}/config"
                 payload = {
-                    "name": name, "unique_id": f"{self.client_id}_{key}",
+                    "name": name, 
+                    "unique_id": f"{self.client_id}_{key}",
                     "state_topic": f"homeassistant/sensor/{self.client_id}_sys/state",
                     "availability_topic": self.master_avail_topic,
-                    "value_template": f"{{{{ value_json.{key} }}}}", "entity_category": "diagnostic",
-                    "device": {"identifiers": [self.client_id], "name": "Wall Solar Monitor"}
+                    "value_template": f"{{{{ value_json.{key} }}}}", 
+                    "entity_category": "diagnostic",
+                    "device": device_info
                 }
                 if d_class: payload["device_class"] = d_class
                 if unit: payload["unit_of_measurement"] = unit
                 if s_class: payload["state_class"] = s_class 
                 self.publish(topic, payload)
+                time.sleep(0.1)
             return True
-        except Exception: return False
+        except (OSError, ValueError):
+            return False
+
 
 # ==========================================
-# 4. THE MAIN LOOP
+# 3. THE MAIN LOOP & ASYNC TASKS
 # ==========================================
-sensors_manager = SensorManager(data_pin_num=15, sensor_list=sensor_names)
-network_controller = NetworkManager(client_id, secrets.mqttBroker, secrets.mqttUser, secrets.mqttPassword)
+async def main() -> None:
+    global system_status, last_published_status, force_sensor_publish, watchdog
 
-last_read_time_secs = 0
-last_heartbeat_time_secs = 0
+    # Start the watchdog strictly when the application loop begins
+    watchdog = machine.WDT(timeout=watchdog_timeout_ms)
 
-while True:
-    watchdog.feed()
-    now_secs = time.time()
+    sensors_manager = SensorManager(data_pin_num=15, sensor_list=sensor_names)
+    network_controller = NetworkManager(
+        client_id, secrets.mqttBroker, secrets.mqttUser, secrets.mqttPassword
+    )
 
-    # 1. Network Housekeeping
-    if not network_controller.maintain_connection():
-        time.sleep(2) 
-        continue
+    # MQTT message callback handler
+    def sub_cb(topic: bytes, msg: bytes) -> None:
+        topic_str = topic.decode("utf-8")
+        msg_str = msg.decode("utf-8")
 
-    # 2. Config Handshake
-    if network_controller.failed_attempts == 0 and last_read_time_secs == 0:
-        if network_controller.send_discovery(sensors_manager.sensors):
-            last_read_time_secs = now_secs - sensor_interval_secs
-            last_heartbeat_time_secs = now_secs - heartbeat_interval_secs
-        else:
-            network_controller.client = None
+        if topic_str == network_controller.ota_cmd_topic:
+            if msg_str.upper() == "PRESS":
+                try:
+                    # Base system telemetry payload
+                    internal_volts = internal_temp_sensor.read_u16() * (3.3 / 65535)
+                    pico_temp_c = round(
+                        27 - (internal_volts - 0.706) / 0.001721, 1
+                    )
+                    sys_data = {
+                        "pico_temp": pico_temp_c,
+                        "rssi": network.WLAN(network.STA_IF).status("rssi"),
+                        "uptime": time.time() - system_start_time_secs,
+                        "version": app_version,
+                        "reconnects": network_controller.reconnects,
+                        "last_reset": last_reset_reason,
+                    }
+
+                    # Stage 1: Announce OTA initiation
+                    sys_data["status"] = "OTA: Initiating Sequence"
+                    network_controller.publish(
+                        f"homeassistant/sensor/{client_id}_sys/state", sys_data
+                    )
+                    
+                    # Suspend RP2040/RP2350 software execution timer constraints natively
+                    # (Fallback safety mechanism is handled by boot.py missing main trigger)
+                    with open("ota_pending.flag", "w") as f:
+                        f.write("pending")
+
+                    try:
+                        os.remove("main_backup.py")
+                    except OSError:
+                        pass
+
+                    os.rename("main.py", "main_backup.py")
+
+                    # Stage 2: Announce download start
+                    sys_data["status"] = "OTA: Downloading Files..."
+                    network_controller.publish(
+                        f"homeassistant/sensor/{client_id}_sys/state", sys_data
+                    )
+                    
+                    # Stage 3: Blocking download
+                    ugit.pull_all(
+                        isconnected=True,
+                        ignore=[
+                            "/README.md",
+                            "/secrets.py",
+                            "/secrets_example.py",
+                            "/config.json",
+                            "/main_backup.py",
+                            "/LICENSE",
+                        ],
+                    )
+
+                    # Stage 3.5: Parse the ugit log for downloaded or updated files
+                    try:
+                        with open("ugit_log.txt", "r") as log_file:
+                            log_lines = log_file.readlines()
+                            
+                        updated_files = []
+                        for line in log_lines:
+                            clean_line = line.strip()
+                            if "updated" in clean_line or "downloaded" in clean_line:
+                                parts = clean_line.split(" ")
+                                if parts:
+                                    file_name = parts[0].lstrip("/")
+                                    if file_name not in updated_files:
+                                        updated_files.append(file_name)
+                                        
+                        if updated_files:
+                            sys_data["status"] = f"OTA Files: {', '.join(updated_files)}"
+                        else:
+                            sys_data["status"] = "OTA: No files changed"
+                            
+                        network_controller.publish(
+                            f"homeassistant/sensor/{client_id}_sys/state", sys_data
+                        )
+                        time.sleep(2)  
+                        
+                    except OSError:
+                        pass
+                    
+                    # Stage 4: Announce reboot
+                    sys_data["status"] = "OTA: Complete. Rebooting"
+                    network_controller.publish(
+                        f"homeassistant/sensor/{client_id}_sys/state", sys_data
+                    )
+                    time.sleep(1)  
+                    machine.reset()
+
+                except Exception as e:
+                    # Stage 5: Handle and log mid-flight failures
+                    sys_data["status"] = f"OTA Failed: {e}"
+                    network_controller.publish(
+                        f"homeassistant/sensor/{client_id}_sys/state", sys_data
+                    )
+                    try:
+                        os.rename("main_backup.py", "main.py")
+                        os.remove("ota_pending.flag")
+                    except OSError:
+                        pass
+                    time.sleep(2)
+                    machine.reset()
+
+    discovery_sent = False
+    last_heartbeat_time_secs = 0
+    last_read_time_secs = 0
+
+    while True:
+        if watchdog is not None:
+            watchdog.feed()
+        now_secs = time.time()
+
+        # 1. Maintain Network Connection
+        if not await network_controller.maintain_connection():
+            discovery_sent = False
+            await asyncio.sleep(2)
             continue
 
-    network_controller.check_messages()
+        if network_controller.client and not discovery_sent:
+            network_controller.client.set_callback(sub_cb)
 
-    # 3. Dynamic Telemetry Broadcast
-    force_heartbeat = (now_secs - last_heartbeat_time_secs >= heartbeat_interval_secs)
-    status_changed = (system_status != last_published_status)
+            # Subscribe to OTA command topic
+            network_controller.client.subscribe(
+                network_controller.ota_cmd_topic.encode("utf-8")
+            )
 
-    if (force_heartbeat or status_changed) and network_controller.client is not None:
-        # Convert internal 16-bit ADC value to voltage, then to Celsius
-        internal_volts = internal_temp_sensor.read_u16() * (3.3 / 65535)
-        pico_temp_c = round(27 - (internal_volts - 0.706) / 0.001721, 1)
+            if network_controller.send_discovery(sensors_manager.sensors):
+                discovery_sent = True
+                last_heartbeat_time_secs = now_secs - heartbeat_interval_secs
+                last_read_time_secs = now_secs - sensor_interval_secs
 
-        sys_data = {
-            "pico_temp": pico_temp_c,
-            "rssi": network.WLAN(network.STA_IF).status('rssi'),
-            "uptime": time.time() - system_start_time_secs,
-            "version": app_version,
-            "reconnects": network_controller.reconnects,
-            "last_reset": last_reset_reason,
-            "status": system_status
-        }
-        network_controller.publish(f"homeassistant/sensor/{client_id}_sys/state", sys_data)
-        last_published_status = system_status
-        if force_heartbeat:
-            force_sensor_publish = True 
-            last_heartbeat_time_secs = now_secs
+        network_controller.check_messages()
 
-    # 4. Sensor Initialization Check
-    if not sensors_manager.is_converting and (now_secs - last_read_time_secs >= sensor_interval_secs):
-        bus_active = sensors_manager.start_conversion()
-        if not bus_active:
-            system_status = "1-Wire Bus Error"
-            for s in sensors_manager.sensors:
-                if s['last_avail'] != 'offline':
-                    network_controller.publish(f"homeassistant/sensor/{s['sensor_id']}/availability", "offline")
-                    s['last_avail'] = 'offline'
-            last_read_time_secs = now_secs 
-        else:
-            if system_status == "1-Wire Bus Error":
-                system_status = "Healthy"
+        # 2. Dynamic System Telemetry Broadcast
+        force_heartbeat = (
+            now_secs - last_heartbeat_time_secs >= heartbeat_interval_secs
+        )
+        status_changed = system_status != last_published_status
 
-    # 5. Data Evaluation Block
-    if sensors_manager.is_converting and time.ticks_diff(time.ticks_ms(), sensors_manager.conversion_start_time_ms) >= sensor_conversion_delay_ms:
-        ready_payloads = sensors_manager.read_and_evaluate(force_publish=force_sensor_publish)
-        force_sensor_publish = False 
-        
-        for item in ready_payloads:
-            network_controller.publish(item['topic'], item['payload'])
-            
-        last_read_time_secs = now_secs
-        gc.collect()
+        if (
+            force_heartbeat or status_changed
+        ) and network_controller.client is not None:
+            internal_volts = internal_temp_sensor.read_u16() * (3.3 / 65535)
+            pico_temp_c = round(
+                27 - (internal_volts - 0.706) / 0.001721, 1
+            )
 
-    time.sleep(0.1)
+            sys_data = {
+                "pico_temp": pico_temp_c,
+                "rssi": network.WLAN(network.STA_IF).status("rssi"),
+                "uptime": time.time() - system_start_time_secs,
+                "version": app_version,
+                "reconnects": network_controller.reconnects,
+                "last_reset": last_reset_reason,
+                "status": system_status,
+            }
+            network_controller.publish(
+                f"homeassistant/sensor/{client_id}_sys/state", sys_data
+            )
+            last_published_status = system_status
+            if force_heartbeat:
+                force_sensor_publish = True
+                last_heartbeat_time_secs = now_secs
+
+        # 3. Poll Sensors 
+        if now_secs - last_read_time_secs >= sensor_interval_secs:
+            bus_active = sensors_manager.start_conversion()
+            if not bus_active:
+                system_status = "1-Wire Bus Error"
+                for s in sensors_manager.sensors:
+                    if s['last_avail'] != 'offline':
+                        network_controller.publish(f"homeassistant/sensor/{s['sensor_id']}/availability", "offline")
+                        s['last_avail'] = 'offline'
+                last_read_time_secs = now_secs 
+            else:
+                if system_status == "1-Wire Bus Error":
+                    system_status = "Healthy"
+                    
+                # 4. Wait for conversion (non-blocking)
+                await asyncio.sleep_ms(750)
+                
+                # 5. Read and Evaluate
+                ready_payloads = sensors_manager.read_and_evaluate(force_publish=force_sensor_publish)
+                force_sensor_publish = False 
+                
+                for item in ready_payloads:
+                    network_controller.publish(item['topic'], item['payload'])
+                    
+                last_read_time_secs = time.time()
+                gc.collect()
+
+        # Brief yield to allow other async operations (like network callbacks) to run
+        await asyncio.sleep(0.1)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
