@@ -15,7 +15,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.13"
+app_version = "5.6.14"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -42,7 +42,7 @@ onboard_led = machine.Pin("LED", machine.Pin.OUT, value=1)
 internal_temp_sensor = machine.ADC(4)
 device_serial = hexlify(machine.unique_id()).decode()
 
-system_status = "Initializing"
+system_status = "nominal - starting"
 last_published_status = ""
 force_sensor_publish = False 
 
@@ -98,17 +98,19 @@ class SensorManager:
         """Starts a temperature conversion and logs bus status for debugging."""
         global system_status
         try:
+            system_status = "nominal - scanning bus"
             self.roms_cache = self.ds_sensor.scan()
             if not self.roms_cache: 
-                system_status = "1-Wire Bus Error (0 ROMs)"
+                system_status = "error - 1-wire bus 0 roms"
                 return False
+            system_status = "nominal - converting temp"
             self.ds_sensor.convert_temp()
             return True
         except (onewire.OneWireError, OSError):
-            system_status = "1-Wire Bus Error"
+            system_status = "error - 1-wire bus error"
             return False
         except Exception:
-            system_status = "1-Wire Bus Exception"
+            system_status = "error - 1-wire exception"
             return False
 
     def read_and_evaluate(self, force_publish: bool = False) -> list:
@@ -116,6 +118,7 @@ class SensorManager:
         updates = []
         bus_fault_detected = False
         try:
+            system_status = "nominal - reading sensors"
             for idx, s in enumerate(self.sensors):
                 temp_c = None
                 if idx < len(self.roms_cache):
@@ -148,13 +151,13 @@ class SensorManager:
                         updates.append({'topic': f"homeassistant/sensor/{s['sensor_id']}/state", 'payload': {"temperature": final_temp_to_evaluate_c}})
                         s['last_temp_c'] = final_temp_to_evaluate_c
                         
-            if system_status in ("Sensor Bus Exception", "1-Wire Bus Error", "1-Wire Bus Error (0 ROMs)", "1-Wire Bus Exception") and not bus_fault_detected:
-                system_status = "Healthy"
+            if system_status.startswith("error - 1-wire") and not bus_fault_detected:
+                system_status = "nominal - mainloop"
                 
         except (onewire.OneWireError, OSError): 
-            system_status = "Sensor Bus Exception"
+            system_status = "error - sensor bus exception"
         except Exception: 
-            system_status = "Sensor Evaluation Error"
+            system_status = "error - sensor evaluation"
         return updates
 
 
@@ -192,7 +195,7 @@ class NetworkManager:
         if wlan.isconnected() and self.client is not None:
             return True
 
-        system_status = "Connecting"
+        system_status = "nominal - connecting wifi"
         if not wlan.isconnected():
             wlan.connect(secrets.wifiSsid, secrets.wifiPassword)
             for _ in range(10):
@@ -204,6 +207,7 @@ class NetworkManager:
 
         if wlan.isconnected():
             try:
+                system_status = "nominal - connecting mqtt"
                 unique_id = self.client_id + "_" + device_serial
                 self.client = MQTTClient(
                     unique_id,
@@ -231,14 +235,14 @@ class NetworkManager:
                 self.reconnects += 1
                 self.failed_attempts = 0
                 self.current_backoff = initial_backoff_secs
-                system_status = "Healthy"
+                system_status = "nominal - mainloop"
                 return True
             except (OSError, MQTTException):
                 self.client = None
 
         self.failed_attempts += 1
         system_status = (
-            f"Network Error ({self.failed_attempts}/{max_failed_attempts})"
+            f"error - network ({self.failed_attempts}/{max_failed_attempts})"
         )
 
         sleep_steps = int(self.current_backoff)
@@ -252,6 +256,8 @@ class NetworkManager:
         )
 
         if self.failed_attempts >= max_failed_attempts:
+            system_status = "error - max network retries, rebooting"
+            time.sleep(1)
             machine.reset()
 
         return False
@@ -286,6 +292,7 @@ class NetworkManager:
     def send_discovery(self, sensors_list: list) -> bool:
         """Send Home Assistant MQTT discovery configuration."""
         try:
+            system_status = "nominal - sending discovery"
             device_info = {
                 "identifiers": [self.client_id, device_serial],
                 "name": "Wall Solar Monitor",
@@ -373,13 +380,14 @@ async def main() -> None:
 
     # MQTT message callback handler
     def sub_cb(topic: bytes, msg: bytes) -> None:
+        global system_status
         topic_str = topic.decode("utf-8")
         msg_str = msg.decode("utf-8")
 
         if topic_str == network_controller.ota_cmd_topic:
             if msg_str.upper() == "PRESS":
                 try:
-                    # Base system telemetry payload
+                    system_status = "nominal - ota initiating"
                     internal_volts = internal_temp_sensor.read_u16() * (3.3 / 65535)
                     pico_temp_c = round(
                         27 - (internal_volts - 0.706) / 0.001721, 1
@@ -393,8 +401,7 @@ async def main() -> None:
                         "last_reset": last_reset_reason,
                     }
 
-                    # Stage 1: Announce OTA initiation
-                    sys_data["status"] = "OTA: Initiating Sequence"
+                    sys_data["status"] = system_status
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
@@ -409,13 +416,12 @@ async def main() -> None:
 
                     os.rename("main.py", "main_backup.py")
 
-                    # Stage 2: Announce download start
-                    sys_data["status"] = "OTA: Downloading Files..."
+                    system_status = "nominal - ota downloading"
+                    sys_data["status"] = system_status
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
                     
-                    # Stage 3: Blocking download
                     ugit.pull_all(
                         isconnected=True,
                         ignore=[
@@ -428,7 +434,6 @@ async def main() -> None:
                         ],
                     )
 
-                    # Stage 3.5: Parse the ugit log for downloaded or updated files
                     try:
                         with open("ugit_log.txt", "r") as log_file:
                             log_lines = log_file.readlines()
@@ -444,10 +449,11 @@ async def main() -> None:
                                         updated_files.append(file_name)
                                         
                         if updated_files:
-                            sys_data["status"] = f"OTA Files: {', '.join(updated_files)}"
+                            system_status = f"nominal - ota files: {', '.join(updated_files)}"
                         else:
-                            sys_data["status"] = "OTA: No files changed"
+                            system_status = "nominal - ota no files changed"
                             
+                        sys_data["status"] = system_status
                         network_controller.publish(
                             f"homeassistant/sensor/{client_id}_sys/state", sys_data
                         )
@@ -456,8 +462,8 @@ async def main() -> None:
                     except OSError:
                         pass
                     
-                    # Stage 4: Announce reboot
-                    sys_data["status"] = "OTA: Complete. Rebooting"
+                    system_status = "nominal - ota complete, rebooting"
+                    sys_data["status"] = system_status
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
@@ -465,8 +471,8 @@ async def main() -> None:
                     machine.reset()
 
                 except Exception as e:
-                    # Stage 5: Handle and log mid-flight failures
-                    sys_data["status"] = f"OTA Failed: {e}"
+                    system_status = f"error - ota failed: {e}"
+                    sys_data["status"] = system_status
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
@@ -481,11 +487,18 @@ async def main() -> None:
     discovery_sent = False
     last_heartbeat_time_secs = 0
     last_read_time_secs = 0
+    last_loop_success_secs = time.time()
 
     while True:
         if watchdog is not None:
             watchdog.feed()
         now_secs = time.time()
+
+        # Software Deadlock Guard: Force reboot if main loop stalls > 120s
+        if now_secs - last_loop_success_secs > 120:
+            system_status = "error - main loop deadlock, forcing reset"
+            time.sleep(1)
+            machine.reset()
 
         # 1. Maintain Network Connection
         if not await network_controller.maintain_connection():
@@ -495,8 +508,6 @@ async def main() -> None:
 
         if network_controller.client and not discovery_sent:
             network_controller.client.set_callback(sub_cb)
-
-            # Subscribe to OTA command topic
             network_controller.client.subscribe(
                 network_controller.ota_cmd_topic.encode("utf-8")
             )
@@ -541,6 +552,7 @@ async def main() -> None:
 
         # 3. Poll Sensors 
         if now_secs - last_read_time_secs >= sensor_interval_secs:
+            system_status = "nominal - sensor conversion"
             bus_active = sensors_manager.start_conversion()
             if not bus_active:
                 for s in sensors_manager.sensors:
@@ -560,8 +572,12 @@ async def main() -> None:
                     network_controller.publish(item['topic'], item['payload'])
                     
                 last_read_time_secs = time.time()
+                system_status = "nominal - mainloop"
 
-        # Brief yield to allow other async operations (like network callbacks) to run
+        # Mark loop cycle success timestamp
+        last_loop_success_secs = now_secs
+
+        # Brief yield to allow other async operations to run
         await asyncio.sleep(0.1)
 
 

@@ -168,3 +168,4 @@ The codebase adheres to strict MicroPython design standards:
 * **v5.6.11:** Another firmware test
 * **v5.6.11:** Firmware testing in Wiska box outside
 * **v5.6.12:** Bus logging improvement
+* **v5.6.14:** Defensive status and loop code to trap issues and avoid network blips
