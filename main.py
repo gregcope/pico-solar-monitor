@@ -15,7 +15,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.12"
+app_version = "5.6.13"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -78,7 +78,7 @@ for i in range(10, 0, -1):
 
 
 # ==========================================
-# 2. THE SENSOR LIBRARY (Median Filtering)
+# 2. THE SENSOR LIBRARY (Median Filtering & Diagnostics)
 # ==========================================
 class SensorManager:
     def __init__(self, data_pin_num: int, sensor_list: list) -> None:
@@ -95,15 +95,20 @@ class SensorManager:
             })
 
     def start_conversion(self) -> bool:
-        """Starts a temperature conversion for all devices on the bus."""
+        """Starts a temperature conversion and logs bus status for debugging."""
         global system_status
         try:
             self.roms_cache = self.ds_sensor.scan()
-            if not self.roms_cache: return False
+            if not self.roms_cache: 
+                system_status = "1-Wire Bus Error (0 ROMs)"
+                return False
             self.ds_sensor.convert_temp()
             return True
         except (onewire.OneWireError, OSError):
             system_status = "1-Wire Bus Error"
+            return False
+        except Exception:
+            system_status = "1-Wire Bus Exception"
             return False
 
     def read_and_evaluate(self, force_publish: bool = False) -> list:
@@ -143,7 +148,7 @@ class SensorManager:
                         updates.append({'topic': f"homeassistant/sensor/{s['sensor_id']}/state", 'payload': {"temperature": final_temp_to_evaluate_c}})
                         s['last_temp_c'] = final_temp_to_evaluate_c
                         
-            if system_status in ("Sensor Bus Exception", "1-Wire Bus Error") and not bus_fault_detected:
+            if system_status in ("Sensor Bus Exception", "1-Wire Bus Error", "1-Wire Bus Error (0 ROMs)", "1-Wire Bus Exception") and not bus_fault_detected:
                 system_status = "Healthy"
                 
         except (onewire.OneWireError, OSError): 
@@ -353,7 +358,7 @@ class NetworkManager:
 
 
 # ==========================================
-# 3. THE MAIN LOOP & ASYNC TASKS
+# 4. THE MAIN LOOP & ASYNC TASKS
 # ==========================================
 async def main() -> None:
     global system_status, last_published_status, force_sensor_publish, watchdog
@@ -394,8 +399,6 @@ async def main() -> None:
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
                     
-                    # Suspend RP2040/RP2350 software execution timer constraints natively
-                    # (Fallback safety mechanism is handled by boot.py missing main trigger)
                     with open("ota_pending.flag", "w") as f:
                         f.write("pending")
 
@@ -540,16 +543,12 @@ async def main() -> None:
         if now_secs - last_read_time_secs >= sensor_interval_secs:
             bus_active = sensors_manager.start_conversion()
             if not bus_active:
-                system_status = "1-Wire Bus Error"
                 for s in sensors_manager.sensors:
                     if s['last_avail'] != 'offline':
                         network_controller.publish(f"homeassistant/sensor/{s['sensor_id']}/availability", "offline")
                         s['last_avail'] = 'offline'
                 last_read_time_secs = now_secs 
             else:
-                if system_status == "1-Wire Bus Error":
-                    system_status = "Healthy"
-                    
                 # 4. Wait for conversion (non-blocking)
                 await asyncio.sleep_ms(750)
                 
@@ -561,7 +560,6 @@ async def main() -> None:
                     network_controller.publish(item['topic'], item['payload'])
                     
                 last_read_time_secs = time.time()
-                gc.collect()
 
         # Brief yield to allow other async operations (like network callbacks) to run
         await asyncio.sleep(0.1)

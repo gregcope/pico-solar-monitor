@@ -167,3 +167,4 @@ The codebase adheres to strict MicroPython design standards:
 * **v5.6.10:** Okay... not going to plan
 * **v5.6.11:** Another firmware test
 * **v5.6.11:** Firmware testing in Wiska box outside
+* **v5.6.12:** Bus logging improvement
