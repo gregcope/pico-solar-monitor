@@ -1,7 +1,9 @@
 import gc
 import os
 import sys
+import time
 import machine
+import asyncio
 
 try:
     import logging
@@ -12,7 +14,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("boot")
 
-boot_version = "5.6.16"
+boot_version = "5.6.18"
 
 
 def init_environment() -> None:
@@ -27,7 +29,7 @@ def perform_rollback(reason: str) -> None:
     logger.warning("boot.py v%s: Initiating rollback due to: %s", boot_version, reason)
     try:
         files = os.listdir()
-        if "main_backup.py" in files:
+        if "main_backup.py" in files or "/main_backup.py" in files:
             try:
                 os.remove("/main.py")
             except OSError:
@@ -64,19 +66,21 @@ def boot_sequence() -> None:
     init_environment()
 
     try:
-        # Attempt to import and execute main application logic
+        # Import main module and explicitly start the main event loop
         import main
+        asyncio.run(main.main())
     except Exception as err:
         logger.error("boot.py v%s: Boot failed with error: %s", boot_version, err)
         if ota_pending:
             perform_rollback(str(err))
         else:
-            # If no OTA was pending but main crashed on import, save crash log
+            # If no OTA was pending but main crashed, save crash log
             try:
                 with open("/fatal_crash.log", "w") as crash_file:
                     sys.print_exception(err, crash_file)
             except OSError:
                 pass
+            time.sleep(2)
             machine.reset()
 
 

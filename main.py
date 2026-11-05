@@ -21,7 +21,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.16"
+app_version = "5.6.18"
 
 # System Logging Configuration
 logging.basicConfig(level=logging.INFO)
@@ -322,7 +322,7 @@ class NetworkManager:
                 logger.error("MQTT check_msg error: %s", err)
                 self.client = None
 
-    def send_discovery(self, sensors_list: list) -> bool:
+    async def send_discovery(self, sensors_list: list) -> bool:
         """Send Home Assistant MQTT discovery configuration."""
         try:
             system_status = "nominal - sending discovery"
@@ -347,7 +347,7 @@ class NetworkManager:
                 "device": device_info,
             }
             self.publish(ota_config_topic, ota_payload)
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
             for s in sensors_list:
                 topic = f"homeassistant/sensor/{s['sensor_id']}_T/config"
@@ -366,7 +366,7 @@ class NetworkManager:
                     "device": device_info
                 }
                 self.publish(topic, payload)
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
             
             sys_sensors = [
                 ("pico_temp", "Internal CPU Temp", "temperature", "°C", "measurement"),
@@ -394,7 +394,7 @@ class NetworkManager:
                 if unit: payload["unit_of_measurement"] = unit
                 if s_class: payload["state_class"] = s_class 
                 self.publish(topic, payload)
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
             return True
         except (OSError, ValueError) as err:
             logger.error("Discovery error: %s", err)
@@ -444,15 +444,15 @@ async def main() -> None:
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
                     
-                    with open("ota_pending.flag", "w") as f:
+                    with open("/ota_pending.flag", "w") as f:
                         f.write("pending")
 
                     try:
-                        os.remove("main_backup.py")
+                        os.remove("/main_backup.py")
                     except OSError:
                         pass
 
-                    os.rename("main.py", "main_backup.py")
+                    os.rename("/main.py", "/main_backup.py")
 
                     system_status = "nominal - ota downloading"
                     sys_data["status"] = system_status
@@ -473,7 +473,7 @@ async def main() -> None:
                     )
 
                     try:
-                        with open("ugit_log.txt", "r") as log_file:
+                        with open("/ugit_log.txt", "r") as log_file:
                             log_lines = log_file.readlines()
                             
                         updated_files = []
@@ -502,7 +502,7 @@ async def main() -> None:
 
                     # Clean up pending flag after successful pull
                     try:
-                        os.remove("ota_pending.flag")
+                        os.remove("/ota_pending.flag")
                     except OSError:
                         pass
                     
@@ -521,8 +521,8 @@ async def main() -> None:
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
                     try:
-                        os.rename("main_backup.py", "main.py")
-                        os.remove("ota_pending.flag")
+                        os.rename("/main_backup.py", "/main.py")
+                        os.remove("/ota_pending.flag")
                     except OSError:
                         pass
                     time.sleep(2)
@@ -558,7 +558,7 @@ async def main() -> None:
                 network_controller.ota_cmd_topic.encode("utf-8")
             )
 
-            if network_controller.send_discovery(sensors_manager.sensors):
+            if await network_controller.send_discovery(sensors_manager.sensors):
                 discovery_sent = True
                 last_heartbeat_time_secs = now_secs - heartbeat_interval_secs
                 last_read_time_secs = now_secs - sensor_interval_secs
