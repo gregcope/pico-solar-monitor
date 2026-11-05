@@ -1,4 +1,3 @@
-python
 import gc
 import os
 import sys
@@ -6,7 +5,7 @@ import time
 import machine
 import asyncio
 
-boot_version = "5.6.19"
+boot_version = "5.6.20"
 
 
 def init_environment() -> None:
