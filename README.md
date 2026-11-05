@@ -78,42 +78,84 @@ This project provides robust, headless environmental telemetry for a domestic so
   }
   ```
 
-## Initial Setup and OTA Bootstrap
+## Required Files for a New Installation
 
-Before deploying the Pico 2 W, you must initialise the local credentials and sync the repository over a physical USB connection using Thonny.
-
-### Required Files for a New Installation
 To set up the Wall Solar Monitor on a fresh device, ensure the following files and packages are placed on the Pico root:
-* **`main.py`**: Core application logic and async control loop.
-* **`boot.py`**: Manages boot errors and automatic rollbacks.
-* **`secrets.py`**: Your Wi-Fi and MQTT credentials.
+
+* **`boot.py`**: Headless boot sequence watchdog, OTA validation, and rollback manager (v5.6.19).
+* **`main.py`**: Core application logic, async loop, hardware drivers, and MQTT management (v5.6.19).
+* **`secrets.py`**: Local operational credentials.
 * **`ugit.py`**: Handles over-the-air firmware updates.
 * **`umqtt.simple`**: Installed via Thonny's package manager for MQTT communication.
 
-### To Setup `ugit.py`
-1. **Configure the Updater:** Run the following commands in the Thonny REPL to link the device to this repository and generate the local configuration:
-   ```python
-   import ugit
-   ugit.create_config(
-       ssid="YOUR_WIFI_SSID",
-       password="YOUR_WIFI_PASSWORD",
-       user="gregcope",
-       repository="pico-solar-monitor",
-       ignore=["/README.md", "/secrets.py", "/secrets_example.py", "/config.json", "/main_backup.py", "/LICENSE", "/.gitignore"]
-   )
-   ```
-2. **Connect and Pull:** Execute the connection and initial sync command in the REPL:
-   ```python
-   import ugit
-   import network
+## Step-by-Step Installation Instructions
 
-   wlan = network.WLAN(network.STA_IF)
-   wlan.active(True)
-   wlan.connect("YOUR_WIFI_SSID", "YOUR_WIFI_PASSWORD")
-   ugit.pull_all(isconnected=True)
-   ```
+### Step 1: Install MicroPython Firmware
+1. Download the official MicroPython UF2 firmware image for the **Raspberry Pi Pico 2 W**.
+2. Hold down the **BOOTSEL** button on your Pico 2 W and plug it into your computer via USB. It will mount as a mass storage drive named `RPI-RP2`.
+3. Drag and drop the downloaded `.uf2` file onto the `RPI-RP2` drive. The Pico will flash the firmware and reboot automatically.
 
-Once bootstrapped, all future code changes pushed to the `main` branch can be deployed by pressing the "Update Firmware" button within Home Assistant.
+### Step 2: Install Required Libraries via Thonny
+1. Open Thonny and ensure your interpreter is set to **MicroPython (Raspberry Pi Pico)**.
+2. Go to **Tools > Manage packages...**.
+3. Search for `micropython-umqtt.simple` and install it directly to your device.
+
+### Step 3: Create and Copy `secrets.py`
+Create a file named `secrets.py` on your computer with your local network credentials and save it to the root of the Pico:
+
+```python
+wifiSsid = "YOUR_WIFI_SSID"
+wifiPassword = "YOUR_WIFI_PASSWORD"
+mqttBroker = "YOUR_HA_MQTT_IP_OR_HOST"
+mqttUser = "mqtt_username"
+mqttPassword = "mqtt_password"
+```
+
+### Step 4: Configure and Bootstrap `ugit.py`
+1. Ensure `ugit.py` is saved in the root of your Pico.
+2. Run the following setup commands in the Thonny REPL to link the device to your repository and generate the local configuration:
+
+```python
+import ugit
+ugit.create_config(
+    ssid="YOUR_WIFI_SSID",
+    password="YOUR_WIFI_PASSWORD",
+    user="gregcope",
+    repository="pico-solar-monitor",
+    ignore=["/README.md", "/secrets.py", "/secrets_example.py", "/config.json", "/main_backup.py", "/LICENSE", "/.gitignore"]
+)
+```
+
+3. Execute the connection and initial sync command in the REPL to pull down your latest codebase (`boot.py` and `main.py`). The `time.sleep` loop prevents socket errors by ensuring the Wi-Fi is fully connected before fetching:
+
+```python
+import ugit
+import network
+import time
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect("YOUR_WIFI_SSID", "YOUR_WIFI_PASSWORD")
+
+while not wlan.isconnected():
+    print("Waiting for Wi-Fi to connect...")
+    time.sleep(1)
+
+print("Wi-Fi Connected!")
+ugit.pull_all(isconnected=True)
+```
+
+### Step 5: Final Verification and Boot
+1. Press `Ctrl+D` in the Thonny REPL to perform a soft reset.
+2. Confirm that the system initializes cleanly without any `ImportError` or missing module exceptions. You should see output similar to the following in the REPL console:
+
+```text
+MPY: soft reboot
+BOOT: boot.py v5.6.19 starting
+BOOT: Environment initialised
+```
+
+Once bootstrapped, all future code changes pushed to your repository can be deployed directly by pressing the "Update Firmware" button within Home Assistant.
 
 ## Troubleshooting and Diagnostic Procedures
 
