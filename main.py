@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import time
 import machine
 import network
@@ -11,11 +12,20 @@ import ds18x20
 from ubinascii import hexlify
 
 try:
+    import logging
+except ImportError:
+    import ulogging as logging
+
+try:
     from simple import MQTTClient
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.14"
+app_version = "5.6.16"
+
+# System Logging Configuration
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("solar_monitor")
 
 # ==========================================
 # 1. CONFIGURATION
@@ -52,11 +62,31 @@ class SensorReadError(Exception):
     pass
 
 
+def check_fatal_crash_log() -> str:
+    """Read fatal crash log without deleting until published."""
+    try:
+        with open("/fatal_crash.log", "r") as crash_file:
+            log_content = crash_file.read().strip()
+        # Truncate string to 250 characters to fit Home Assistant entity limit
+        return log_content[:250] if log_content else "Empty Crash Log"
+    except OSError:
+        return ""
+
+
+last_crash_log = check_fatal_crash_log()
+
+
 def get_reset_cause() -> str:
-    """Determine the reset cause, prioritizing OTA firmware updates."""
+    """Determine reset cause prioritizing crash dumps and OTA updates."""
+    if last_crash_log:
+        return f"Fatal Crash: {last_crash_log}"
+
     try:
         with open("/ugit_log.txt", "r") as log_file:
             log_data = log_file.read()
+        if "OTA Interrupted" in log_data:
+            os.remove("/ugit_log.txt")
+            return "OTA Interrupted - Rolled Back"
         if "/main.py updated" in log_data:
             os.remove("/ugit_log.txt")
             return "Firmware Upgrade"
@@ -64,15 +94,18 @@ def get_reset_cause() -> str:
         pass
 
     cause = machine.reset_cause()
-    if cause == machine.PWRON_RESET: return "Power On"
-    if cause == machine.WDT_RESET: return "Watchdog Timer"
-    if cause == machine.SOFT_RESET: return "Software Reset"
+    if cause == machine.PWRON_RESET:
+        return "Power On"
+    if cause == machine.WDT_RESET:
+        return "Watchdog Timer"
+    if cause == machine.SOFT_RESET:
+        return "Software Reset"
     return "Unknown"
 
 
 last_reset_reason = get_reset_cause()
 
-for i in range(10, 0, -1):
+for _ in range(10):
     onboard_led.toggle()
     time.sleep(0.2)
 
@@ -106,11 +139,8 @@ class SensorManager:
             system_status = "nominal - converting temp"
             self.ds_sensor.convert_temp()
             return True
-        except (onewire.OneWireError, OSError):
-            system_status = "error - 1-wire bus error"
-            return False
-        except Exception:
-            system_status = "error - 1-wire exception"
+        except (onewire.OneWireError, OSError) as err:
+            system_status = f"error - 1-wire bus error: {err}"
             return False
 
     def read_and_evaluate(self, force_publish: bool = False) -> list:
@@ -124,14 +154,16 @@ class SensorManager:
                 if idx < len(self.roms_cache):
                     try:
                         t = self.ds_sensor.read_temp(self.roms_cache[idx])
-                        if t != 85.0 and t != -127.0: temp_c = t
+                        if t != 85.0 and t != -127.0: 
+                            temp_c = t
                     except (onewire.OneWireError, OSError):
                         bus_fault_detected = True
                 
                 if temp_c is not None:
                     s['fail_count'] = 0
                     s['history'].append(temp_c)
-                    if len(s['history']) > 3: s['history'].pop(0)
+                    if len(s['history']) > 3: 
+                        s['history'].pop(0)
                     sorted_history = sorted(s['history'])
                     filtered_temp_c = sorted_history[1] if len(sorted_history) == 3 else sorted_history[-1]
                     filtered_temp_c = round(filtered_temp_c, 1)
@@ -154,10 +186,8 @@ class SensorManager:
             if system_status.startswith("error - 1-wire") and not bus_fault_detected:
                 system_status = "nominal - mainloop"
                 
-        except (onewire.OneWireError, OSError): 
-            system_status = "error - sensor bus exception"
-        except Exception: 
-            system_status = "error - sensor evaluation"
+        except (onewire.OneWireError, OSError) as err: 
+            system_status = f"error - sensor bus exception: {err}"
         return updates
 
 
@@ -165,7 +195,7 @@ class SensorManager:
 # 3. THE NETWORK MANAGER
 # ==========================================
 class NetworkManager:
-    """Manages WiFi connectivity, MQTT communication, exponential backoff, and discovery payloads."""
+    """Manages WiFi connectivity, MQTT communication, exponential backoff and discovery payloads."""
 
     def __init__(
         self, client_id: str, broker: str, user: str, password: str
@@ -224,20 +254,20 @@ class NetworkManager:
                 )
 
                 self.client.connect()
-                self.publish(self.master_avail_topic, "online", retain=True)
+                
+                # Enforce non-blocking five second timeout on socket reads and writes
+                if hasattr(self.client, "sock") and self.client.sock is not None:
+                    self.client.sock.settimeout(5.0)
 
-                # --- OTA Validation Handshake ---
-                try:
-                    os.remove("ota_pending.flag")
-                except OSError:
-                    pass
+                self.publish(self.master_avail_topic, "online", retain=True)
 
                 self.reconnects += 1
                 self.failed_attempts = 0
                 self.current_backoff = initial_backoff_secs
                 system_status = "nominal - mainloop"
                 return True
-            except (OSError, MQTTException):
+            except (OSError, MQTTException) as err:
+                logger.error("MQTT connection failed: %s", err)
                 self.client = None
 
         self.failed_attempts += 1
@@ -257,6 +287,7 @@ class NetworkManager:
 
         if self.failed_attempts >= max_failed_attempts:
             system_status = "error - max network retries, rebooting"
+            logger.error(system_status)
             time.sleep(1)
             machine.reset()
 
@@ -277,7 +308,8 @@ class NetworkManager:
             )
             self.client.publish(t_bytes, p_bytes, retain=retain)
             return True
-        except (OSError, MQTTException):
+        except (OSError, MQTTException) as err:
+            logger.error("MQTT publish error to %s: %s", topic, err)
             self.client = None
             return False
 
@@ -286,7 +318,8 @@ class NetworkManager:
         if self.client:
             try:
                 self.client.check_msg()
-            except (OSError, MQTTException):
+            except (OSError, MQTTException) as err:
+                logger.error("MQTT check_msg error: %s", err)
                 self.client = None
 
     def send_discovery(self, sensors_list: list) -> bool:
@@ -335,13 +368,16 @@ class NetworkManager:
                 self.publish(topic, payload)
                 time.sleep(0.1)
             
-            sys_sensors = [("pico_temp", "Internal CPU Temp", "temperature", "°C", "measurement"),
-                           ("rssi", "Signal Strength", "signal_strength", "dBm", "measurement"), 
-                           ("uptime", "Uptime", "duration", "s", None),
-                           ("version", "Firmware Version", None, None, None), 
-                           ("reconnects", "Reconnect Count", None, None, None),
-                           ("last_reset", "Last Reset Reason", None, None, None), 
-                           ("status", "System Status", None, None, None)]
+            sys_sensors = [
+                ("pico_temp", "Internal CPU Temp", "temperature", "°C", "measurement"),
+                ("rssi", "Signal Strength", "signal_strength", "dBm", "measurement"), 
+                ("uptime", "Uptime", "duration", "s", None),
+                ("version", "Firmware Version", None, None, None), 
+                ("reconnects", "Reconnect Count", None, None, None),
+                ("last_reset", "Last Reset Reason", None, None, None), 
+                ("crash_log", "Crash Log", None, None, None),
+                ("status", "System Status", None, None, None)
+            ]
                            
             for key, name, d_class, unit, s_class in sys_sensors:
                 topic = f"homeassistant/sensor/{self.client_id}_{key}/config"
@@ -360,7 +396,8 @@ class NetworkManager:
                 self.publish(topic, payload)
                 time.sleep(0.1)
             return True
-        except (OSError, ValueError):
+        except (OSError, ValueError) as err:
+            logger.error("Discovery error: %s", err)
             return False
 
 
@@ -368,9 +405,9 @@ class NetworkManager:
 # 4. THE MAIN LOOP & ASYNC TASKS
 # ==========================================
 async def main() -> None:
-    global system_status, last_published_status, force_sensor_publish, watchdog
+    global system_status, last_published_status, force_sensor_publish, watchdog, last_crash_log
 
-    # Start the watchdog strictly when the application loop begins
+    # Start hardware watchdog strictly when application loop begins
     watchdog = machine.WDT(timeout=watchdog_timeout_ms)
 
     sensors_manager = SensorManager(data_pin_num=15, sensor_list=sensor_names)
@@ -399,9 +436,10 @@ async def main() -> None:
                         "version": app_version,
                         "reconnects": network_controller.reconnects,
                         "last_reset": last_reset_reason,
+                        "crash_log": last_crash_log,
+                        "status": system_status,
                     }
 
-                    sys_data["status"] = system_status
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
@@ -461,6 +499,12 @@ async def main() -> None:
                         
                     except OSError:
                         pass
+
+                    # Clean up pending flag after successful pull
+                    try:
+                        os.remove("ota_pending.flag")
+                    except OSError:
+                        pass
                     
                     system_status = "nominal - ota complete, rebooting"
                     sys_data["status"] = system_status
@@ -470,8 +514,8 @@ async def main() -> None:
                     time.sleep(1)  
                     machine.reset()
 
-                except Exception as e:
-                    system_status = f"error - ota failed: {e}"
+                except Exception as err:
+                    system_status = f"error - ota failed: {err}"
                     sys_data["status"] = system_status
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
@@ -494,15 +538,17 @@ async def main() -> None:
             watchdog.feed()
         now_secs = time.time()
 
-        # Software Deadlock Guard: Force reboot if main loop stalls > 120s
-        if now_secs - last_loop_success_secs > 120:
+        # Software Deadlock Guard: Force reboot ONLY if connected to MQTT but loop processing stalled > 120s
+        if network_controller.client is not None and (now_secs - last_loop_success_secs > 120):
             system_status = "error - main loop deadlock, forcing reset"
+            logger.error(system_status)
             time.sleep(1)
             machine.reset()
 
         # 1. Maintain Network Connection
         if not await network_controller.maintain_connection():
             discovery_sent = False
+            last_loop_success_secs = now_secs  # Reset timer during network backoff
             await asyncio.sleep(2)
             continue
 
@@ -540,11 +586,20 @@ async def main() -> None:
                 "version": app_version,
                 "reconnects": network_controller.reconnects,
                 "last_reset": last_reset_reason,
+                "crash_log": last_crash_log,
                 "status": system_status,
             }
-            network_controller.publish(
+            if network_controller.publish(
                 f"homeassistant/sensor/{client_id}_sys/state", sys_data
-            )
+            ):
+                # Safely delete fatal crash log only after successful MQTT transmission
+                if last_crash_log:
+                    try:
+                        os.remove("/fatal_crash.log")
+                        last_crash_log = ""
+                    except OSError:
+                        pass
+
             last_published_status = system_status
             if force_heartbeat:
                 force_sensor_publish = True
@@ -586,3 +641,12 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        # Catch fatal unhandled top-level crashes to flash before rebooting
+        try:
+            with open("/fatal_crash.log", "w") as crash_file:
+                sys.print_exception(exc, crash_file)
+        except OSError:
+            pass
+        time.sleep(1)
+        machine.reset()
