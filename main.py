@@ -12,25 +12,16 @@ import ds18x20
 from ubinascii import hexlify
 
 try:
-    import logging
-except ImportError:
-    import ulogging as logging
-
-try:
     from simple import MQTTClient
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.18"
-
-# System Logging Configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("solar_monitor")
+app_version = "5.6.19"
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-client_id = "solar_monitor"
+client_id = "wall_solar_monitor"
 sensor_names = ["Bottom", "Middle", "TopL", "TopR"]
 
 # Time and Threshold Variables
@@ -267,7 +258,7 @@ class NetworkManager:
                 system_status = "nominal - mainloop"
                 return True
             except (OSError, MQTTException) as err:
-                logger.error("MQTT connection failed: %s", err)
+                print(f"MQTT connection failed: {err}")
                 self.client = None
 
         self.failed_attempts += 1
@@ -287,7 +278,7 @@ class NetworkManager:
 
         if self.failed_attempts >= max_failed_attempts:
             system_status = "error - max network retries, rebooting"
-            logger.error(system_status)
+            print(system_status)
             time.sleep(1)
             machine.reset()
 
@@ -309,7 +300,7 @@ class NetworkManager:
             self.client.publish(t_bytes, p_bytes, retain=retain)
             return True
         except (OSError, MQTTException) as err:
-            logger.error("MQTT publish error to %s: %s", topic, err)
+            print(f"MQTT publish error to {topic}: {err}")
             self.client = None
             return False
 
@@ -319,7 +310,7 @@ class NetworkManager:
             try:
                 self.client.check_msg()
             except (OSError, MQTTException) as err:
-                logger.error("MQTT check_msg error: %s", err)
+                print(f"MQTT check_msg error: {err}")
                 self.client = None
 
     async def send_discovery(self, sensors_list: list) -> bool:
@@ -397,7 +388,7 @@ class NetworkManager:
                 await asyncio.sleep(0.1)
             return True
         except (OSError, ValueError) as err:
-            logger.error("Discovery error: %s", err)
+            print(f"Discovery error: {err}")
             return False
 
 
@@ -541,7 +532,7 @@ async def main() -> None:
         # Software Deadlock Guard: Force reboot ONLY if connected to MQTT but loop processing stalled > 120s
         if network_controller.client is not None and (now_secs - last_loop_success_secs > 120):
             system_status = "error - main loop deadlock, forcing reset"
-            logger.error(system_status)
+            print(system_status)
             time.sleep(1)
             machine.reset()
 

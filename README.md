@@ -1,11 +1,11 @@
-# Wall Solar Monitor:100000
+# Wall Solar Monitor
 
 MicroPython firmware designed for a Raspberry Pi Pico 2 W to track the performance and thermal characteristics of a home solar panel array via MQTT and Home Assistant auto-discovery. This document serves as both a human-readable guide and a precise execution specification for GenAI software engineering agents.
 
 ## Repository Structure
 
 ```text
-wall-solar-monitor/
+pico-solar-monitor/
 ├── boot.py              # Headless boot sequence watchdog, OTA validation and rollback manager
 ├── main.py              # Core application logic, async loop, hardware drivers and MQTT management
 ├── secrets.py           # Local operational credentials (git-ignored)
@@ -21,9 +21,10 @@ This project provides robust, headless environmental telemetry for a domestic so
 
 ## Architectural Decisions and Strict Constraints
 
-* **No Local Logging (Strict Constraint):** Local file logging is entirely prohibited during standard execution to prevent unnecessary write wear on the microcontroller flash storage. All diagnostics and telemetry are routed live via MQTT to Home Assistant.
+* **No Local Logging (Strict Constraint):** Local file logging is entirely prohibited during standard execution to prevent unnecessary write wear on the microcontroller flash storage. Standard built-in `print()` statements are used exclusively for serial debugging. All diagnostics and telemetry are routed live via MQTT to Home Assistant.
+* **Emergency Crash Logging:** Unhandled top-level exceptions are written to disk as `/fatal_crash.log`, transmitted upstream to Home Assistant via MQTT on the next clean boot, and then safely deleted to prevent flash wear.
 * **Asynchronous Execution (Strict Constraint):** The firmware operates entirely within an asynchronous asyncio event loop. Blocking synchronous I/O operations are forbidden to prevent freezing the event loop, except during an active OTA download sequence.
-* **OTA Validation and Rollback:** Firmware updates are executed seamlessly via MQTT. To protect the inaccessible hardware, an ota_pending.flag is created before downloading new code. The boot.py script acts as a gatekeeper; if the new main.py fails to initialise and clear the flag, boot.py deletes the corrupted file, restores main_backup.py and resets the hardware.
+* **OTA Validation and Rollback:** Firmware updates are executed seamlessly via MQTT. To protect the inaccessible hardware, an `ota_pending.flag` is created before downloading new code. The `boot.py` script acts as a gatekeeper; if the new `main.py` fails to initialise and clear the flag, `boot.py` deletes the corrupted file, restores `main_backup.py` and resets the hardware.
 * **Resilient Network Management:** Employs an exponential backoff retry loop coupled with an eight-second hardware watchdog timer. If Wi-Fi or MQTT communication fails repeatedly, the system safely backs off before triggering a clean hardware reset.
 * **Sensor Noise Reduction:** Implements a three-sample median filter combined with a 0.3°C delta threshold to eliminate raw sensor jitter and prevent excessive MQTT database chatter.
 * **Fault Isolation:** If a single DS18B20 probe drops from the 1-wire bus, the logic flags only that specific sensor as offline while keeping the broader system status healthy, preventing transient bus jitter from cascading into a global system fault.
@@ -43,7 +44,7 @@ This project provides robust, headless environmental telemetry for a domestic so
 
 * **Watchdog Timeout:** 8000 ms (eight seconds). The hardware watchdog must be fed on every iteration of the main loop.
 * **Exponential Backoff Sequence:** Initial backoff is set to 1.0 second, scaling by a multiplier of two on each failure up to a maximum cap of 60.0 seconds.
-* **Failure Threshold:** Reaching 20 consecutive failed connection attempts triggers an automatic hardware reset via machine.reset().
+* **Failure Threshold:** Reaching 20 consecutive failed connection attempts triggers an automatic hardware reset via `machine.reset()`.
 * **Sensor Polling Cycle:** Non-blocking 750 ms 1-Wire conversion delay followed by active task coordination.
 
 ## Error Handling and Exception Paths
@@ -54,10 +55,9 @@ This project provides robust, headless environmental telemetry for a domestic so
 
 ## MQTT Discovery and Data Contracts
 
-* **Master Availability Topic:** homeassistant/sensor/wall_solar_monitor/availability (online / offline with retained LWT).
+* **Master Availability Topic:** `homeassistant/sensor/wall_solar_monitor/availability` (online / offline with retained LWT).
 * **OTA Update Button Topics:**
-  * Command: homeassistant/update/wall_solar_monitor/set
-  * State: Managed by Home Assistant via the master availability topic.
+  * Command: `homeassistant/button/solar_monitor_ota/set`
 * **Sensor State Payload Schema:**
   ```json
   {
@@ -70,29 +70,27 @@ This project provides robust, headless environmental telemetry for a domestic so
     "pico_temp": 28.4,
     "rssi": -65,
     "uptime": 3600,
-    "version": "1.7.0",
+    "version": "5.6.19",
     "reconnects": 1,
     "last_reset": "Power On",
-    "status": "Healthy"
+    "crash_log": "Empty Crash Log",
+    "status": "nominal - mainloop"
   }
   ```
+
 ## Initial Setup and OTA Bootstrap
 
-Before deploying the Pico two W, you must initialise the local credentials and sync the repository over a physical USB connection using Thonny.
+Before deploying the Pico 2 W, you must initialise the local credentials and sync the repository over a physical USB connection using Thonny.
 
-## Required Files for a New Installation
-
-To set up the MVHR monitor on a fresh device, ensure the following files and packages are placed on the Pico root:
-
+### Required Files for a New Installation
+To set up the Wall Solar Monitor on a fresh device, ensure the following files and packages are placed on the Pico root:
 * **`main.py`**: Core application logic and async control loop.
 * **`boot.py`**: Manages boot errors and automatic rollbacks.
 * **`secrets.py`**: Your Wi-Fi and MQTT credentials.
 * **`ugit.py`**: Handles over-the-air firmware updates.
 * **`umqtt.simple`**: Installed via Thonny's package manager for MQTT communication.
 
-
-To setup ugit.py
-
+### To Setup `ugit.py`
 1. **Configure the Updater:** Run the following commands in the Thonny REPL to link the device to this repository and generate the local configuration:
    ```python
    import ugit
@@ -100,7 +98,7 @@ To setup ugit.py
        ssid="YOUR_WIFI_SSID",
        password="YOUR_WIFI_PASSWORD",
        user="gregcope",
-       repository="mvhr-pico",
+       repository="pico-solar-monitor",
        ignore=["/README.md", "/secrets.py", "/secrets_example.py", "/config.json", "/main_backup.py", "/LICENSE", "/.gitignore"]
    )
    ```
@@ -117,24 +115,6 @@ To setup ugit.py
 
 Once bootstrapped, all future code changes pushed to the `main` branch can be deployed by pressing the "Update Firmware" button within Home Assistant.
 
-## Home Assistant Configuration Examples
-
-### Lovelace Dashboard Sensor Card Example
-
-type: entities
-title: Wall Solar Array Temperatures
-entities:
-  - entity: sensor.wall_solar_monitor_bottom_temperature
-    name: Bottom Array
-  - entity: sensor.wall_solar_monitor_middle_temperature
-    name: Middle Array
-  - entity: sensor.wall_solar_monitor_topl_temperature
-    name: Top Left Array
-  - entity: sensor.wall_solar_monitor_topr_temperature
-    name: Top Right Array
-  - entity: sensor.wall_solar_monitor_status
-    name: System Status
-
 ## Troubleshooting and Diagnostic Procedures
 
 ### 1. One-Wire Bus Errors
@@ -147,25 +127,9 @@ entities:
 
 ### 3. MQTT Disconnection Loops
 * **Symptom:** The Pico repeatedly resets or spends extended periods in the connecting state.
-* **Action:** Check network signal strength via the rssi diagnostic entity. Confirm that the broker credentials stored in secrets.py are correct and that the MQTT keepalive grace period is respected.
-
-## Code Style and Standards
-
-The codebase adheres to strict MicroPython design standards:
-* **PEP8 & Formatting:** Strict adherence to snake_case variable naming, PEP8 rules, and clean code structure.
-* **Static Type Hints:** Fully typed functions and methods across all modules.
-* **Standard Asynchronous Programming:** Uses async/await for all I/O operations to prevent blocking the event loop.
+* **Action:** Check network signal strength via the rssi diagnostic entity. Confirm that the broker credentials stored in `secrets.py` are correct and that the MQTT keepalive grace period is respected.
 
 ## Major Version History
 
-* **v1.7.0:** Upgraded underlying architecture to match the MVHR asynchronous logic. Introduced OTA firmware update capability via MQTT and ugit, formal Device Registry integration, and enhanced fault-isolated system diagnostics.
-* **v5.6.5:** Stabilized headless resilience with global system status strings, 8-second hardware watchdog timer, and network backoff logic.
-* **v5.6.6:** Bump version for upgrade testing
-* **v5.6.7:** Bump version for upgrade testing from github
-* **v5.6.8:** Fix MQTT sensor names
-* **v5.6.9:** Post typo fix firmware test
-* **v5.6.10:** Okay... not going to plan
-* **v5.6.11:** Another firmware test
-* **v5.6.11:** Firmware testing in Wiska box outside
-* **v5.6.12:** Bus logging improvement
-* **v5.6.14:** Defensive status and loop code to trap issues and avoid network blips
+* **v5.6.19:** Completely purged `ulogging` module dependencies in favor of standard `print()` statements to prevent import crashes on standard MicroPython builds. Stabilized emergency crash logging and Home Assistant reporting.
+* **v5.6.5 – v5.6.18:** Stabilized headless resilience with global system status strings, eight-second hardware watchdog timer, network backoff logic, and async discovery patterns.

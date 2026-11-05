@@ -1,3 +1,4 @@
+python
 import gc
 import os
 import sys
@@ -5,28 +6,19 @@ import time
 import machine
 import asyncio
 
-try:
-    import logging
-except ImportError:
-    import ulogging as logging
-
-# System Logging Configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("boot")
-
-boot_version = "5.6.18"
+boot_version = "5.6.19"
 
 
 def init_environment() -> None:
     """Configure baseline garbage collection and system thresholds."""
     gc.enable()
     gc.threshold(gc.mem_free() // 4)
-    logger.info("boot.py v%s: Environment initialised", boot_version)
+    print(f"boot.py v{boot_version}: Environment initialised")
 
 
 def perform_rollback(reason: str) -> None:
     """Roll back main.py to main_backup.py upon startup failure."""
-    logger.warning("boot.py v%s: Initiating rollback due to: %s", boot_version, reason)
+    print(f"boot.py v{boot_version}: Initiating rollback due to: {reason}")
     try:
         files = os.listdir()
         if "main_backup.py" in files or "/main_backup.py" in files:
@@ -44,12 +36,12 @@ def perform_rollback(reason: str) -> None:
             with open("/ugit_log.txt", "w") as log_file:
                 log_file.write(f"OTA Interrupted - Rolled Back ({reason})")
                 
-            logger.info("boot.py v%s: Rollback complete. Resetting machine...", boot_version)
+            print(f"boot.py v{boot_version}: Rollback complete. Resetting machine...")
             machine.reset()
         else:
-            logger.error("boot.py v%s: Rollback failed - main_backup.py missing", boot_version)
+            print(f"boot.py v{boot_version}: Rollback failed - main_backup.py missing")
     except Exception as rb_err:
-        logger.error("boot.py v%s: Critical failure during rollback: %s", boot_version, rb_err)
+        print(f"boot.py v{boot_version}: Critical failure during rollback: {rb_err}")
 
 
 def boot_sequence() -> None:
@@ -59,7 +51,7 @@ def boot_sequence() -> None:
         with open("/ota_pending.flag", "r") as flag_file:
             _ = flag_file.read()
         ota_pending = True
-        logger.info("boot.py v%s: OTA pending flag detected. Monitoring boot...", boot_version)
+        print(f"boot.py v{boot_version}: OTA pending flag detected. Monitoring boot...")
     except OSError:
         pass
 
@@ -70,7 +62,7 @@ def boot_sequence() -> None:
         import main
         asyncio.run(main.main())
     except Exception as err:
-        logger.error("boot.py v%s: Boot failed with error: %s", boot_version, err)
+        print(f"boot.py v{boot_version}: Boot failed with error: {err}")
         if ota_pending:
             perform_rollback(str(err))
         else:
@@ -85,5 +77,5 @@ def boot_sequence() -> None:
 
 
 if __name__ == "__main__":
-    logger.info("boot.py v%s: Starting boot sequence", boot_version)
+    print(f"boot.py v{boot_version}: Starting boot sequence")
     boot_sequence()
