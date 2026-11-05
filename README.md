@@ -28,6 +28,7 @@ This project provides robust, headless environmental telemetry for a domestic so
 * **Resilient Network Management:** Employs an exponential backoff retry loop coupled with an eight-second hardware watchdog timer. If Wi-Fi or MQTT communication fails repeatedly, the system safely backs off before triggering a clean hardware reset.
 * **Sensor Noise Reduction:** Implements a three-sample median filter combined with a 0.3°C delta threshold to eliminate raw sensor jitter and prevent excessive MQTT database chatter.
 * **Fault Isolation:** If a single DS18B20 probe drops from the 1-wire bus, the logic flags only that specific sensor as offline while keeping the broader system status healthy, preventing transient bus jitter from cascading into a global system fault.
+* **LED:** Blink the LED on, on activity only.
 
 ## Hardware Architecture and Wiring
 

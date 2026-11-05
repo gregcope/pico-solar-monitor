@@ -16,7 +16,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.22"
+app_version = "5.6.23"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -39,13 +39,23 @@ max_failed_attempts = 20
 # --- System Internals ---
 system_start_time_secs = time.time()
 watchdog = None
-onboard_led = machine.Pin("LED", machine.Pin.OUT, value=1)
+onboard_led = machine.Pin("LED", machine.Pin.OUT, value=0)
 internal_temp_sensor = machine.ADC(4)
 device_serial = hexlify(machine.unique_id()).decode()
 
 system_status = "nominal - starting"
 last_published_status = ""
 force_sensor_publish = False 
+
+
+def flash_led(duration_ms: int = 30) -> None:
+    """Briefly flash the onboard LED to indicate activity."""
+    try:
+        onboard_led.value(1)
+        time.sleep_ms(duration_ms)
+        onboard_led.value(0)
+    except Exception:
+        pass
 
 
 class SensorReadError(Exception):
@@ -96,9 +106,12 @@ def get_reset_cause() -> str:
 
 last_reset_reason = get_reset_cause()
 
-for _ in range(10):
-    onboard_led.toggle()
-    time.sleep(0.2)
+# Brief startup double-blink to confirm clean boot
+for _ in range(2):
+    onboard_led.value(1)
+    time.sleep(0.15)
+    onboard_led.value(0)
+    time.sleep(0.15)
 
 
 # ==========================================
@@ -129,6 +142,7 @@ class SensorManager:
                 return False
             system_status = "nominal - converting temp"
             self.ds_sensor.convert_temp()
+            flash_led(20)
             return True
         except (onewire.OneWireError, OSError) as err:
             system_status = f"error - 1-wire bus error: {err}"
@@ -256,6 +270,7 @@ class NetworkManager:
                 self.failed_attempts = 0
                 self.current_backoff = initial_backoff_secs
                 system_status = "nominal - mainloop"
+                flash_led(40)
                 return True
             except (OSError, MQTTException) as err:
                 print(f"MQTT connection failed: {err}")
@@ -298,6 +313,7 @@ class NetworkManager:
                 else str(payload_data).encode("utf-8")
             )
             self.client.publish(t_bytes, p_bytes, retain=retain)
+            flash_led(15)
             return True
         except (OSError, MQTTException) as err:
             print(f"MQTT publish error to {topic}: {err}")
