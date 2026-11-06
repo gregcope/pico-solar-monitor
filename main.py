@@ -17,7 +17,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.31"
+app_version = "5.6.32"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -193,9 +193,6 @@ class SensorManager:
                         updates.append({'topic': f"homeassistant/sensor/{s['sensor_id']}/state", 'payload': {"temperature": final_temp_to_evaluate_c}})
                         s['last_temp_c'] = final_temp_to_evaluate_c
                         
-            if system_status.startswith("error - 1-wire") and not bus_fault_detected:
-                system_status = "nominal - mainloop"
-                
         except (onewire.OneWireError, OSError) as err: 
             if not system_status.startswith("recovered"):
                 system_status = f"error - sensor bus exception: {err}"
@@ -662,7 +659,13 @@ async def main() -> None:
                     network_controller.publish(item['topic'], item['payload'])
                     
                 last_read_time_secs = time.time()
-                system_status = "nominal - mainloop"
+                
+                offline_names = [s['sensor_name'] for s in sensors_manager.sensors if s['last_avail'] == 'offline']
+                if offline_names:
+                    if not system_status.startswith("recovered"):
+                        system_status = f"error - missing: {','.join(offline_names)}"
+                else:
+                    system_status = "nominal - mainloop"
 
         last_loop_success_secs = now_secs
 

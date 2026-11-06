@@ -5,7 +5,7 @@ import time
 import machine
 import asyncio
 
-boot_version = "5.6.31"
+boot_version = "5.6.32"
 
 STARTUP_GRACE_PERIOD_SECS = 5
 
