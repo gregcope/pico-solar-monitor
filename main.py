@@ -17,7 +17,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTClient, MQTTException
 
-app_version = "5.6.25"
+app_version = "5.6.27"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -136,17 +136,21 @@ class SensorManager:
         """Starts a temperature conversion and logs bus status for debugging."""
         global system_status
         try:
-            system_status = "nominal - scanning bus"
+            if not system_status.startswith("recovered"):
+                system_status = "nominal - scanning bus"
             self.roms_cache = self.ds_sensor.scan()
             if not self.roms_cache: 
-                system_status = "error - 1-wire bus 0 roms"
+                if not system_status.startswith("recovered"):
+                    system_status = "error - 1-wire bus 0 roms"
                 return False
-            system_status = "nominal - converting temp"
+            if not system_status.startswith("recovered"):
+                system_status = "nominal - converting temp"
             self.ds_sensor.convert_temp()
             flash_led(20)
             return True
         except (onewire.OneWireError, OSError) as err:
-            system_status = f"error - 1-wire bus error: {err}"
+            if not system_status.startswith("recovered"):
+                system_status = f"error - 1-wire bus error: {err}"
             return False
 
     def read_and_evaluate(self, force_publish: bool = False) -> list:
@@ -154,7 +158,8 @@ class SensorManager:
         updates = []
         bus_fault_detected = False
         try:
-            system_status = "nominal - reading sensors"
+            if not system_status.startswith("recovered"):
+                system_status = "nominal - reading sensors"
             for idx, s in enumerate(self.sensors):
                 temp_c = None
                 if idx < len(self.roms_cache):
@@ -193,7 +198,8 @@ class SensorManager:
                 system_status = "nominal - mainloop"
                 
         except (onewire.OneWireError, OSError) as err: 
-            system_status = f"error - sensor bus exception: {err}"
+            if not system_status.startswith("recovered"):
+                system_status = f"error - sensor bus exception: {err}"
         return updates
 
 
@@ -214,13 +220,7 @@ class NetworkManager:
         self.failed_attempts = 0
         self.reconnects = 0
         self.current_backoff = initial_backoff_secs
-
-        self.master_avail_topic = (
-            f"homeassistant/sensor/{self.client_id}/availability"
-        )
-        self.ota_cmd_topic = (
-            f"homeassistant/button/{self.client_id}_ota/set"
-        )
+        self.last_network_error = ""
 
     async def maintain_connection(self) -> bool:
         """Maintain robust network and MQTT connectivity using exponential backoff."""
@@ -231,7 +231,9 @@ class NetworkManager:
         if wlan.isconnected() and self.client is not None:
             return True
 
-        system_status = "nominal - connecting wifi"
+        if not system_status.startswith("recovered"):
+            system_status = "nominal - connecting wifi"
+            
         if not wlan.isconnected():
             wlan.connect(secrets.wifiSsid, secrets.wifiPassword)
             for _ in range(10):
@@ -240,10 +242,15 @@ class NetworkManager:
                 if watchdog is not None:
                     watchdog.feed()
                 await asyncio.sleep(1)
+            
+            if not wlan.isconnected():
+                self.last_network_error = "WiFi association timeout"
 
         if wlan.isconnected():
             try:
-                system_status = "nominal - connecting mqtt"
+                if not system_status.startswith("recovered"):
+                    system_status = "nominal - connecting mqtt"
+                    
                 unique_id = self.client_id + "_" + device_serial
                 self.client = MQTTClient(
                     unique_id,
@@ -266,6 +273,7 @@ class NetworkManager:
                     addr = socket.getaddrinfo(self.broker, 1883)[0][-1]
                     pre_sock.connect(addr)
                 except OSError as pre_flight_err:
+                    self.last_network_error = f"TCP pre-flight: {pre_flight_err}"
                     raise MQTTException(
                         "Broker unreachable during TCP pre-flight check"
                     ) from pre_flight_err
@@ -274,7 +282,7 @@ class NetworkManager:
 
                 self.client.connect()
                 
-                # Enforce non-blocking five-second timeout on socket reads and writes
+                # Enforce non-blocking five second timeout on socket reads and writes
                 if hasattr(self.client, "sock") and self.client.sock is not None:
                     self.client.sock.settimeout(5.0)
 
@@ -283,17 +291,28 @@ class NetworkManager:
                 self.reconnects += 1
                 self.failed_attempts = 0
                 self.current_backoff = initial_backoff_secs
-                system_status = "nominal - mainloop"
+                
+                if self.last_network_error:
+                    system_status = f"recovered - {self.last_network_error}"
+                    self.last_network_error = ""
+                else:
+                    system_status = "nominal - mainloop"
+                    
                 flash_led(40)
                 return True
             except (OSError, MQTTException) as err:
+                if not self.last_network_error:
+                    self.last_network_error = f"MQTT connect error: {err}"
                 print(f"MQTT connection failed: {err}")
                 self.client = None
 
         self.failed_attempts += 1
-        system_status = (
-            f"error - network ({self.failed_attempts}/{max_failed_attempts})"
-        )
+        
+        # Only override status to error if we aren't displaying a recovery message
+        if not system_status.startswith("recovered"):
+            system_status = (
+                f"error - network ({self.failed_attempts}/{max_failed_attempts})"
+            )
 
         sleep_steps = int(self.current_backoff)
         for _ in range(max(1, sleep_steps)):
@@ -345,8 +364,10 @@ class NetworkManager:
 
     async def send_discovery(self, sensors_list: list) -> bool:
         """Send Home Assistant MQTT discovery configuration."""
+        global system_status
         try:
-            system_status = "nominal - sending discovery"
+            if not system_status.startswith("recovered"):
+                system_status = "nominal - sending discovery"
             device_info = {
                 "identifiers": [self.client_id, device_serial],
                 "name": "Wall Solar Monitor",
@@ -628,7 +649,8 @@ async def main() -> None:
 
         # 3. Poll Sensors 
         if now_secs - last_read_time_secs >= sensor_interval_secs:
-            system_status = "nominal - sensor conversion"
+            if not system_status.startswith("recovered"):
+                system_status = "nominal - sensor conversion"
             bus_active = sensors_manager.start_conversion()
             if not bus_active:
                 for s in sensors_manager.sensors:
@@ -648,6 +670,7 @@ async def main() -> None:
                     network_controller.publish(item['topic'], item['payload'])
                     
                 last_read_time_secs = time.time()
+                # Clear recovery status naturally at the end of the sensor read cycle
                 system_status = "nominal - mainloop"
 
         # Mark loop cycle success timestamp

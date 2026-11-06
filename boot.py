@@ -5,7 +5,7 @@ import time
 import machine
 import asyncio
 
-boot_version = "5.6.25"
+boot_version = "5.6.27"
 
 
 def init_environment() -> None:
