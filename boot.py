@@ -5,7 +5,7 @@ import time
 import machine
 import asyncio
 
-boot_version = "5.6.30"
+boot_version = "5.6.31"
 
 STARTUP_GRACE_PERIOD_SECS = 5
 
@@ -18,11 +18,12 @@ def init_environment() -> None:
 
 
 def startup_grace_period() -> bool:
-    """Provide a brief window on boot to catch KeyboardInterrupt (Ctrl+C) and enter REPL."""
+    """Provide a brief window on boot to actively catch KeyboardInterrupt (Ctrl+C) and enter REPL."""
     print(f"boot.py v{boot_version}: Boot... graceperiod {STARTUP_GRACE_PERIOD_SECS}s sleeping awaiting console interrupt")
+    start_time = time.time()
     try:
-        for remaining in range(STARTUP_GRACE_PERIOD_SECS, 0, -1):
-            time.sleep(1)
+        while time.time() - start_time < STARTUP_GRACE_PERIOD_SECS:
+            time.sleep_ms(100)
         print(f"boot.py v{boot_version}: Boot ... graceperiod complete carrying on with boot")
         return True
     except KeyboardInterrupt:
