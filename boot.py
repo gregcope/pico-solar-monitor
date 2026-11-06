@@ -5,7 +5,9 @@ import time
 import machine
 import asyncio
 
-boot_version = "5.6.27"
+boot_version = "5.6.30"
+
+STARTUP_GRACE_PERIOD_SECS = 5
 
 
 def init_environment() -> None:
@@ -13,6 +15,19 @@ def init_environment() -> None:
     gc.enable()
     gc.threshold(gc.mem_free() // 4)
     print(f"boot.py v{boot_version}: Environment initialised")
+
+
+def startup_grace_period() -> bool:
+    """Provide a brief window on boot to catch KeyboardInterrupt (Ctrl+C) and enter REPL."""
+    print(f"boot.py v{boot_version}: Boot... graceperiod {STARTUP_GRACE_PERIOD_SECS}s sleeping awaiting console interrupt")
+    try:
+        for remaining in range(STARTUP_GRACE_PERIOD_SECS, 0, -1):
+            time.sleep(1)
+        print(f"boot.py v{boot_version}: Boot ... graceperiod complete carrying on with boot")
+        return True
+    except KeyboardInterrupt:
+        print("\n*** BOOT ABORTED BY USER *** Entering interactive REPL.")
+        return False
 
 
 def perform_rollback(reason: str) -> None:
@@ -44,7 +59,10 @@ def perform_rollback(reason: str) -> None:
 
 
 def boot_sequence() -> None:
-    """Execute boot sequence with OTA monitoring and main import protection."""
+    """Execute boot sequence with graceful interrupt protection and OTA monitoring."""
+    if not startup_grace_period():
+        return
+
     ota_pending = False
     try:
         with open("/ota_pending.flag", "r") as flag_file:
@@ -57,7 +75,6 @@ def boot_sequence() -> None:
     init_environment()
 
     try:
-        # Import main module and explicitly start the main event loop
         import main
         asyncio.run(main.main())
     except Exception as err:
@@ -65,7 +82,6 @@ def boot_sequence() -> None:
         if ota_pending:
             perform_rollback(str(err))
         else:
-            # If no OTA was pending but main crashed, save crash log
             try:
                 with open("/fatal_crash.log", "w") as crash_file:
                     sys.print_exception(err, crash_file)

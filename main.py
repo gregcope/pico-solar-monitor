@@ -13,11 +13,11 @@ import socket
 from ubinascii import hexlify
 
 try:
-    from simple import MQTTClient, MQTTException
+    from simple import MQTTClient
 except ImportError:
-    from umqtt.simple import MQTTClient, MQTTException
+    from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.27"
+app_version = "5.6.30"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -69,7 +69,6 @@ def check_fatal_crash_log() -> str:
     try:
         with open("/fatal_crash.log", "r") as crash_file:
             log_content = crash_file.read().strip()
-        # Truncate string to 250 characters to fit Home Assistant entity limit
         return log_content[:250] if log_content else "Empty Crash Log"
     except OSError:
         return ""
@@ -222,6 +221,13 @@ class NetworkManager:
         self.current_backoff = initial_backoff_secs
         self.last_network_error = ""
 
+        self.master_avail_topic = (
+            f"homeassistant/sensor/{self.client_id}/availability"
+        )
+        self.ota_cmd_topic = (
+            f"homeassistant/button/{self.client_id}_ota/set"
+        )
+
     async def maintain_connection(self) -> bool:
         """Maintain robust network and MQTT connectivity using exponential backoff."""
         global system_status
@@ -266,7 +272,6 @@ class NetworkManager:
                     lwt_topic_bytes, b"offline", retain=True
                 )
 
-                # Pre-flight TCP check to ensure broker is reachable before blocking connect
                 pre_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 pre_sock.settimeout(5.0)
                 try:
@@ -282,7 +287,6 @@ class NetworkManager:
 
                 self.client.connect()
                 
-                # Enforce non-blocking five second timeout on socket reads and writes
                 if hasattr(self.client, "sock") and self.client.sock is not None:
                     self.client.sock.settimeout(5.0)
 
@@ -308,7 +312,6 @@ class NetworkManager:
 
         self.failed_attempts += 1
         
-        # Only override status to error if we aren't displaying a recovery message
         if not system_status.startswith("recovered"):
             system_status = (
                 f"error - network ({self.failed_attempts}/{max_failed_attempts})"
@@ -376,7 +379,6 @@ class NetworkManager:
                 "serial_number": device_serial,
             }
 
-            # Register OTA Update Button
             ota_config_topic = (
                 f"homeassistant/button/{self.client_id}_ota/config"
             )
@@ -449,7 +451,6 @@ class NetworkManager:
 async def main() -> None:
     global system_status, last_published_status, force_sensor_publish, watchdog, last_crash_log
 
-    # Start hardware watchdog strictly when application loop begins
     watchdog = machine.WDT(timeout=watchdog_timeout_ms)
 
     sensors_manager = SensorManager(data_pin_num=15, sensor_list=sensor_names)
@@ -457,7 +458,6 @@ async def main() -> None:
         client_id, secrets.mqttBroker, secrets.mqttUser, secrets.mqttPassword
     )
 
-    # MQTT message callback handler
     def sub_cb(topic: bytes, msg: bytes) -> None:
         global system_status
         topic_str = topic.decode("utf-8")
@@ -542,7 +542,6 @@ async def main() -> None:
                     except OSError:
                         pass
 
-                    # Clean up pending flag after successful pull
                     try:
                         os.remove("/ota_pending.flag")
                     except OSError:
@@ -580,17 +579,15 @@ async def main() -> None:
             watchdog.feed()
         now_secs = time.time()
 
-        # Software Deadlock Guard: Force reboot ONLY if connected to MQTT but loop processing stalled > 120s
         if network_controller.client is not None and (now_secs - last_loop_success_secs > 120):
             system_status = "error - main loop deadlock, forcing reset"
             print(system_status)
             time.sleep(1)
             machine.reset()
 
-        # 1. Maintain Network Connection
         if not await network_controller.maintain_connection():
             discovery_sent = False
-            last_loop_success_secs = now_secs  # Reset timer during network backoff
+            last_loop_success_secs = now_secs
             await asyncio.sleep(2)
             continue
 
@@ -607,7 +604,6 @@ async def main() -> None:
 
         network_controller.check_messages()
 
-        # 2. Dynamic System Telemetry Broadcast
         force_heartbeat = (
             now_secs - last_heartbeat_time_secs >= heartbeat_interval_secs
         )
@@ -634,7 +630,6 @@ async def main() -> None:
             if network_controller.publish(
                 f"homeassistant/sensor/{client_id}_sys/state", sys_data
             ):
-                # Safely delete fatal crash log only after successful MQTT transmission
                 if last_crash_log:
                     try:
                         os.remove("/fatal_crash.log")
@@ -647,7 +642,6 @@ async def main() -> None:
                 force_sensor_publish = True
                 last_heartbeat_time_secs = now_secs
 
-        # 3. Poll Sensors 
         if now_secs - last_read_time_secs >= sensor_interval_secs:
             if not system_status.startswith("recovered"):
                 system_status = "nominal - sensor conversion"
@@ -659,10 +653,8 @@ async def main() -> None:
                         s['last_avail'] = 'offline'
                 last_read_time_secs = now_secs 
             else:
-                # 4. Wait for conversion (non-blocking)
                 await asyncio.sleep_ms(750)
                 
-                # 5. Read and Evaluate
                 ready_payloads = sensors_manager.read_and_evaluate(force_publish=force_sensor_publish)
                 force_sensor_publish = False 
                 
@@ -670,13 +662,10 @@ async def main() -> None:
                     network_controller.publish(item['topic'], item['payload'])
                     
                 last_read_time_secs = time.time()
-                # Clear recovery status naturally at the end of the sensor read cycle
                 system_status = "nominal - mainloop"
 
-        # Mark loop cycle success timestamp
         last_loop_success_secs = now_secs
 
-        # Brief yield to allow other async operations to run
         await asyncio.sleep(0.1)
 
 
@@ -686,7 +675,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as exc:
-        # Catch fatal unhandled top-level crashes to flash before rebooting
         try:
             with open("/fatal_crash.log", "w") as crash_file:
                 sys.print_exception(exc, crash_file)
