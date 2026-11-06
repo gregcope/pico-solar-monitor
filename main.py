@@ -9,14 +9,15 @@ import secrets
 import ugit
 import onewire
 import ds18x20
+import socket
 from ubinascii import hexlify
 
 try:
-    from simple import MQTTClient
+    from simple import MQTTClient, MQTTException
 except ImportError:
-    from umqtt.simple import MQTTException, MQTTClient
+    from umqtt.simple import MQTTClient, MQTTException
 
-app_version = "5.6.23"
+app_version = "5.6.25"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -258,9 +259,22 @@ class NetworkManager:
                     lwt_topic_bytes, b"offline", retain=True
                 )
 
+                # Pre-flight TCP check to ensure broker is reachable before blocking connect
+                pre_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                pre_sock.settimeout(5.0)
+                try:
+                    addr = socket.getaddrinfo(self.broker, 1883)[0][-1]
+                    pre_sock.connect(addr)
+                except OSError as pre_flight_err:
+                    raise MQTTException(
+                        "Broker unreachable during TCP pre-flight check"
+                    ) from pre_flight_err
+                finally:
+                    pre_sock.close()
+
                 self.client.connect()
                 
-                # Enforce non-blocking five second timeout on socket reads and writes
+                # Enforce non-blocking five-second timeout on socket reads and writes
                 if hasattr(self.client, "sock") and self.client.sock is not None:
                     self.client.sock.settimeout(5.0)
 
