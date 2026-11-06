@@ -152,8 +152,10 @@ ugit.pull_all(isconnected=True)
 
 ```text
 MPY: soft reboot
-boot.py v5.6.20: Starting boot sequence
-boot.py v5.6.20: Environment initialised
+boot.py v5.6.30: Starting boot sequence
+boot.py v5.6.30: Boot... graceperiod 5s sleeping awaiting console interrupt
+boot.py v5.6.30: Boot ... graceperiod complete carrying on with boot
+boot.py v5.6.30: Environment initialised
 ```
 
 Once bootstrapped, all future code changes pushed to your repository can be deployed directly by pressing the "Update Firmware" button within Home Assistant.
