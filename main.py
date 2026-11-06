@@ -17,7 +17,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.32"
+app_version = "5.6.33"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -105,6 +105,15 @@ def get_reset_cause() -> str:
 
 
 last_reset_reason = get_reset_cause()
+
+
+def get_rssi() -> int:
+    """Safely fetch RSSI to prevent OSErrors during transient drops."""
+    try:
+        return network.WLAN(network.STA_IF).status("rssi")
+    except OSError:
+        return -99
+
 
 # Brief startup double-blink to confirm clean boot
 for _ in range(2):
@@ -470,7 +479,7 @@ async def main() -> None:
                     )
                     sys_data = {
                         "pico_temp": pico_temp_c,
-                        "rssi": network.WLAN(network.STA_IF).status("rssi"),
+                        "rssi": get_rssi(),
                         "uptime": time.time() - system_start_time_secs,
                         "version": app_version,
                         "reconnects": network_controller.reconnects,
@@ -616,7 +625,7 @@ async def main() -> None:
 
             sys_data = {
                 "pico_temp": pico_temp_c,
-                "rssi": network.WLAN(network.STA_IF).status("rssi"),
+                "rssi": get_rssi(),
                 "uptime": time.time() - system_start_time_secs,
                 "version": app_version,
                 "reconnects": network_controller.reconnects,
@@ -633,6 +642,9 @@ async def main() -> None:
                         last_crash_log = ""
                     except OSError:
                         pass
+                last_published_status = system_status
+                if system_status.startswith("recovered"):
+                    system_status = "nominal - mainloop"
 
             last_published_status = system_status
             if force_heartbeat:
@@ -662,8 +674,7 @@ async def main() -> None:
                 
                 offline_names = [s['sensor_name'] for s in sensors_manager.sensors if s['last_avail'] == 'offline']
                 if offline_names:
-                    if not system_status.startswith("recovered"):
-                        system_status = f"error - missing: {','.join(offline_names)}"
+                    system_status = f"error - missing: {','.join(offline_names)}"
                 else:
                     system_status = "nominal - mainloop"
 
