@@ -17,7 +17,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.33"
+app_version = "5.6.34"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -225,7 +225,7 @@ class NetworkManager:
         self.failed_attempts = 0
         self.reconnects = 0
         self.current_backoff = initial_backoff_secs
-        self.last_network_error = ""
+        self.last_disconnect_reason = ""
 
         self.master_avail_topic = (
             f"homeassistant/sensor/{self.client_id}/availability"
@@ -233,6 +233,24 @@ class NetworkManager:
         self.ota_cmd_topic = (
             f"homeassistant/button/{self.client_id}_ota/set"
         )
+
+    def _parse_oserror(self, err: Exception) -> str:
+        """Map OS exception codes to human readable disconnection reasons."""
+        if isinstance(err, OSError) and len(err.args) > 0:
+            err_code = err.args[0]
+            if err_code == 104:
+                return "TCP Connection Reset (Broker Shutdown)"
+            elif err_code == 110:
+                return "TCP Timeout"
+            elif err_code == 113:
+                return "No Route to Host"
+            elif err_code == 32:
+                return "Broken Pipe"
+            elif err_code == -1: # generic esp32/lwip connect error 
+                return "Socket Connect Failed"
+            else:
+                return f"OSError {err_code}"
+        return f"{type(err).__name__}: {err}"
 
     async def maintain_connection(self) -> bool:
         """Maintain robust network and MQTT connectivity using exponential backoff."""
@@ -256,7 +274,7 @@ class NetworkManager:
                 await asyncio.sleep(1)
             
             if not wlan.isconnected():
-                self.last_network_error = "WiFi association timeout"
+                self.last_disconnect_reason = "WiFi association timeout"
 
         if wlan.isconnected():
             try:
@@ -284,7 +302,7 @@ class NetworkManager:
                     addr = socket.getaddrinfo(self.broker, 1883)[0][-1]
                     pre_sock.connect(addr)
                 except OSError as pre_flight_err:
-                    self.last_network_error = f"TCP pre-flight: {pre_flight_err}"
+                    self.last_disconnect_reason = f"Pre-flight: {self._parse_oserror(pre_flight_err)}"
                     raise MQTTException(
                         "Broker unreachable during TCP pre-flight check"
                     ) from pre_flight_err
@@ -302,17 +320,17 @@ class NetworkManager:
                 self.failed_attempts = 0
                 self.current_backoff = initial_backoff_secs
                 
-                if self.last_network_error:
-                    system_status = f"recovered - {self.last_network_error}"
-                    self.last_network_error = ""
+                if self.last_disconnect_reason:
+                    system_status = f"recovered - {self.last_disconnect_reason}"
+                    self.last_disconnect_reason = ""
                 else:
                     system_status = "nominal - mainloop"
                     
                 flash_led(40)
                 return True
             except (OSError, MQTTException) as err:
-                if not self.last_network_error:
-                    self.last_network_error = f"MQTT connect error: {err}"
+                if not self.last_disconnect_reason:
+                    self.last_disconnect_reason = f"Connect: {self._parse_oserror(err)}"
                 print(f"MQTT connection failed: {err}")
                 self.client = None
 
@@ -358,7 +376,8 @@ class NetworkManager:
             flash_led(15)
             return True
         except (OSError, MQTTException) as err:
-            print(f"MQTT publish error to {topic}: {err}")
+            self.last_disconnect_reason = f"Publish Drop: {self._parse_oserror(err)}"
+            print(f"MQTT publish error to {topic}: {self.last_disconnect_reason}")
             self.client = None
             return False
 
@@ -368,7 +387,8 @@ class NetworkManager:
             try:
                 self.client.check_msg()
             except (OSError, MQTTException) as err:
-                print(f"MQTT check_msg error: {err}")
+                self.last_disconnect_reason = f"Receive Drop: {self._parse_oserror(err)}"
+                print(f"MQTT check_msg error: {self.last_disconnect_reason}")
                 self.client = None
 
     async def send_discovery(self, sensors_list: list) -> bool:
