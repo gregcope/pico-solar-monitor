@@ -1,3 +1,8 @@
+"""MicroPython firmware for a Solar Wall temperature monitor.
+
+Running on a Raspberry Pi Pico 2 W with DS18B20 temp sensors.
+"""
+
 import asyncio
 import json
 import os
@@ -17,7 +22,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.37"
+app_version = "5.6.38"
 
 # ==========================================
 # 1. CONFIGURATION
