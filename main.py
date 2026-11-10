@@ -17,7 +17,7 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.35"
+app_version = "5.6.37"
 
 # ==========================================
 # 1. CONFIGURATION
@@ -246,7 +246,7 @@ class NetworkManager:
                 return "No Route to Host"
             elif err_code == 32:
                 return "Broken Pipe"
-            elif err_code == -1: # generic esp32/lwip connect error 
+            elif err_code == -1: 
                 return "Socket Connect Failed"
             else:
                 return f"OSError {err_code}"
@@ -254,7 +254,7 @@ class NetworkManager:
 
     async def maintain_connection(self) -> bool:
         """Maintain robust network and MQTT connectivity using exponential backoff."""
-        global system_status
+        global system_status, last_reset_reason
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
 
@@ -321,6 +321,8 @@ class NetworkManager:
                 self.current_backoff = initial_backoff_secs
                 
                 if self.last_disconnect_reason:
+                    # Overload the global last_reset_reason with the disconnect cause
+                    last_reset_reason = self.last_disconnect_reason
                     system_status = f"recovered - {self.last_disconnect_reason}"
                     self.last_disconnect_reason = ""
                 else:
