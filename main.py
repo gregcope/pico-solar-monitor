@@ -22,27 +22,39 @@ try:
 except ImportError:
     from umqtt.simple import MQTTException, MQTTClient
 
-app_version = "5.6.38"
+app_version = "5.6.39"
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
 client_id = "wall_solar_monitor"
+
+# Fallback ordered names used only while sensor_map is empty
 sensor_names = ["Bottom", "Middle", "TopL", "TopR"]
 
+# Map 16-char hex ROM IDs to friendly names once discovered via Home Assistant
+# Example:
+# sensor_map = {
+#     "28ff641e821603a1": "Bottom",
+#     "28ff1234567890ab": "Middle",
+#     "28ffabcdef123456": "TopL",
+#     "28ff9876543210fe": "TopR",
+# }
+sensor_map: dict[str, str] = {}
+
 # Time and Threshold Variables
-sensor_interval_secs = 5 
-heartbeat_interval_secs = 300 
-sensor_change_threshold_c = 0.3 
+sensor_interval_secs = 5
+heartbeat_interval_secs = 300
+sensor_change_threshold_c = 0.3
 
 # Hardware and Network Timing
-watchdog_timeout_ms = 8000 
+watchdog_timeout_ms = 8000
 mqtt_keepalive_grace_secs = 20
 initial_backoff_secs = 1.0
 max_backoff_secs = 60.0
 max_failed_attempts = 20
 
-# --- System Internals ---
+# Global variables
 system_start_time_secs = time.time()
 watchdog = None
 onboard_led = machine.Pin("LED", machine.Pin.OUT, value=0)
@@ -51,7 +63,9 @@ device_serial = hexlify(machine.unique_id()).decode()
 
 system_status = "nominal - starting"
 last_published_status = ""
-force_sensor_publish = False 
+force_sensor_publish = False
+last_crash_log = ""
+last_reset_reason = "Unknown"
 
 
 def flash_led(duration_ms: int = 30) -> None:
@@ -66,6 +80,7 @@ def flash_led(duration_ms: int = 30) -> None:
 
 class SensorReadError(Exception):
     """Raised when an individual 1-Wire sensor read fails."""
+
     pass
 
 
@@ -77,9 +92,6 @@ def check_fatal_crash_log() -> str:
         return log_content[:250] if log_content else "Empty Crash Log"
     except OSError:
         return ""
-
-
-last_crash_log = check_fatal_crash_log()
 
 
 def get_reset_cause() -> str:
@@ -109,9 +121,6 @@ def get_reset_cause() -> str:
     return "Unknown"
 
 
-last_reset_reason = get_reset_cause()
-
-
 def get_rssi() -> int:
     """Safely fetch RSSI to prevent OSErrors during transient drops."""
     try:
@@ -120,39 +129,85 @@ def get_rssi() -> int:
         return -99
 
 
-# Brief startup double-blink to confirm clean boot
-for _ in range(2):
-    onboard_led.value(1)
-    time.sleep(0.15)
-    onboard_led.value(0)
-    time.sleep(0.15)
+def init_system() -> None:
+    """Populate startup diagnostics and blink onboard LED on clean boot."""
+    global last_crash_log, last_reset_reason
+    last_crash_log = check_fatal_crash_log()
+    last_reset_reason = get_reset_cause()
+
+    # Brief startup double-blink to confirm clean boot
+    for _ in range(2):
+        onboard_led.value(1)
+        time.sleep(0.15)
+        onboard_led.value(0)
+        time.sleep(0.15)
 
 
 # ==========================================
 # 2. THE SENSOR LIBRARY (Median Filtering & Diagnostics)
 # ==========================================
 class SensorManager:
-    def __init__(self, data_pin_num: int, sensor_list: list) -> None:
+    """Manages 1-Wire DS18B20 scanning, ROM mapping, median filtering and state."""
+
+    def __init__(
+        self,
+        data_pin_num: int,
+        sensor_list: list[str],
+        rom_mapping: dict[str, str],
+    ) -> None:
         self.data_pin = machine.Pin(data_pin_num)
         self.ds_bus = onewire.OneWire(self.data_pin)
         self.ds_sensor = ds18x20.DS18X20(self.ds_bus)
-        self.roms_cache = []
-        self.sensors = []
-        for name in sensor_list:
-            self.sensors.append({
-                'sensor_name': name, 'sensor_id': name, 
-                'last_temp_c': -999.0, 'last_avail': 'unknown', 
-                'history': [], 'fail_count': 0 
-            })
+        self.rom_mapping = {k.lower(): v for k, v in rom_mapping.items()}
+        self.roms_cache: list[bytearray] = []
+        self.discovered_roms_hex: list[str] = []
+        self.sensors: list[dict] = []
+
+        # Build sensor tracking entries from explicit ROM map or fallback list
+        if self.rom_mapping:
+            for rom_hex, name in self.rom_mapping.items():
+                self.sensors.append(
+                    {
+                        "rom_hex": rom_hex,
+                        "sensor_name": name,
+                        "sensor_id": name,
+                        "last_temp_c": -999.0,
+                        "last_avail": "unknown",
+                        "history": [],
+                        "fail_count": 0,
+                    }
+                )
+        else:
+            for name in sensor_list:
+                self.sensors.append(
+                    {
+                        "rom_hex": None,
+                        "sensor_name": name,
+                        "sensor_id": name,
+                        "last_temp_c": -999.0,
+                        "last_avail": "unknown",
+                        "history": [],
+                        "fail_count": 0,
+                    }
+                )
+
+    def get_discovered_roms_str(self) -> str:
+        """Return comma-separated hex ROM IDs currently visible on the 1-Wire bus."""
+        if not self.discovered_roms_hex:
+            return "none"
+        return ", ".join(self.discovered_roms_hex)
 
     def start_conversion(self) -> bool:
-        """Starts a temperature conversion and logs bus status for debugging."""
+        """Start temperature conversion and cache active ROM addresses."""
         global system_status
         try:
             if not system_status.startswith("recovered"):
                 system_status = "nominal - scanning bus"
             self.roms_cache = self.ds_sensor.scan()
-            if not self.roms_cache: 
+            self.discovered_roms_hex = [
+                hexlify(rom).decode().lower() for rom in self.roms_cache
+            ]
+            if not self.roms_cache:
                 if not system_status.startswith("recovered"):
                     system_status = "error - 1-wire bus 0 roms"
                 return False
@@ -166,48 +221,87 @@ class SensorManager:
                 system_status = f"error - 1-wire bus error: {err}"
             return False
 
-    def read_and_evaluate(self, force_publish: bool = False) -> list:
+    def read_and_evaluate(self, force_publish: bool = False) -> list[dict]:
+        """Read temperatures by ROM match (or index fallback) and apply median filter."""
         global system_status
-        updates = []
-        bus_fault_detected = False
+        updates: list[dict] = []
+
+        # Build lookup of hex ROM -> raw bytearray from latest bus scan
+        active_rom_by_hex = {
+            hexlify(rom).decode().lower(): rom for rom in self.roms_cache
+        }
+
         try:
             if not system_status.startswith("recovered"):
                 system_status = "nominal - reading sensors"
             for idx, s in enumerate(self.sensors):
                 temp_c = None
-                if idx < len(self.roms_cache):
+                target_rom = None
+
+                # Match by explicit ROM hex if configured; otherwise fall back to bus index
+                if s["rom_hex"] is not None:
+                    target_rom = active_rom_by_hex.get(s["rom_hex"])
+                elif idx < len(self.roms_cache):
+                    target_rom = self.roms_cache[idx]
+
+                if target_rom is not None:
                     try:
-                        t = self.ds_sensor.read_temp(self.roms_cache[idx])
-                        if t != 85.0 and t != -127.0: 
+                        t = self.ds_sensor.read_temp(target_rom)
+                        if t != 85.0 and t != -127.0:
                             temp_c = t
                     except (onewire.OneWireError, OSError):
-                        bus_fault_detected = True
-                
+                        pass
+
                 if temp_c is not None:
-                    s['fail_count'] = 0
-                    s['history'].append(temp_c)
-                    if len(s['history']) > 3: 
-                        s['history'].pop(0)
-                    sorted_history = sorted(s['history'])
-                    filtered_temp_c = sorted_history[1] if len(sorted_history) == 3 else sorted_history[-1]
+                    s["fail_count"] = 0
+                    s["history"].append(temp_c)
+                    if len(s["history"]) > 3:
+                        s["history"].pop(0)
+                    sorted_history = sorted(s["history"])
+                    filtered_temp_c = (
+                        sorted_history[1]
+                        if len(sorted_history) == 3
+                        else sorted_history[-1]
+                    )
                     filtered_temp_c = round(filtered_temp_c, 1)
                     current_avail = "online"
                     final_temp_to_evaluate_c = filtered_temp_c
                 else:
-                    s['fail_count'] += 1
+                    s["fail_count"] += 1
                     final_temp_to_evaluate_c = None
-                    current_avail = "offline" if s['fail_count'] >= 3 else s['last_avail'] 
-                
-                if force_publish or current_avail != s['last_avail']:
-                    updates.append({'topic': f"homeassistant/sensor/{s['sensor_id']}/availability", 'payload': current_avail})
-                    s['last_avail'] = current_avail
-                    
-                if current_avail == "online" and final_temp_to_evaluate_c is not None:
-                    if force_publish or abs(final_temp_to_evaluate_c - s['last_temp_c']) >= sensor_change_threshold_c:
-                        updates.append({'topic': f"homeassistant/sensor/{s['sensor_id']}/state", 'payload': {"temperature": final_temp_to_evaluate_c}})
-                        s['last_temp_c'] = final_temp_to_evaluate_c
-                        
-        except (onewire.OneWireError, OSError) as err: 
+                    current_avail = (
+                        "offline" if s["fail_count"] >= 3 else s["last_avail"]
+                    )
+
+                if force_publish or current_avail != s["last_avail"]:
+                    updates.append(
+                        {
+                            "topic": f"homeassistant/sensor/{s['sensor_id']}/availability",
+                            "payload": current_avail,
+                        }
+                    )
+                    s["last_avail"] = current_avail
+
+                if (
+                    current_avail == "online"
+                    and final_temp_to_evaluate_c is not None
+                ):
+                    if (
+                        force_publish
+                        or abs(final_temp_to_evaluate_c - s["last_temp_c"])
+                        >= sensor_change_threshold_c
+                    ):
+                        updates.append(
+                            {
+                                "topic": f"homeassistant/sensor/{s['sensor_id']}/state",
+                                "payload": {
+                                    "temperature": final_temp_to_evaluate_c
+                                },
+                            }
+                        )
+                        s["last_temp_c"] = final_temp_to_evaluate_c
+
+        except (onewire.OneWireError, OSError) as err:
             if not system_status.startswith("recovered"):
                 system_status = f"error - sensor bus exception: {err}"
         return updates
@@ -251,7 +345,7 @@ class NetworkManager:
                 return "No Route to Host"
             elif err_code == 32:
                 return "Broken Pipe"
-            elif err_code == -1: 
+            elif err_code == -1:
                 return "Socket Connect Failed"
             else:
                 return f"OSError {err_code}"
@@ -268,7 +362,7 @@ class NetworkManager:
 
         if not system_status.startswith("recovered"):
             system_status = "nominal - connecting wifi"
-            
+
         if not wlan.isconnected():
             wlan.connect(secrets.wifiSsid, secrets.wifiPassword)
             for _ in range(10):
@@ -277,7 +371,7 @@ class NetworkManager:
                 if watchdog is not None:
                     watchdog.feed()
                 await asyncio.sleep(1)
-            
+
             if not wlan.isconnected():
                 self.last_disconnect_reason = "WiFi association timeout"
 
@@ -285,7 +379,7 @@ class NetworkManager:
             try:
                 if not system_status.startswith("recovered"):
                     system_status = "nominal - connecting mqtt"
-                    
+
                 unique_id = self.client_id + "_" + device_serial
                 self.client = MQTTClient(
                     unique_id,
@@ -307,7 +401,9 @@ class NetworkManager:
                     addr = socket.getaddrinfo(self.broker, 1883)[0][-1]
                     pre_sock.connect(addr)
                 except OSError as pre_flight_err:
-                    self.last_disconnect_reason = f"Pre-flight: {self._parse_oserror(pre_flight_err)}"
+                    self.last_disconnect_reason = (
+                        f"Pre-flight: {self._parse_oserror(pre_flight_err)}"
+                    )
                     raise MQTTException(
                         "Broker unreachable during TCP pre-flight check"
                     ) from pre_flight_err
@@ -315,7 +411,7 @@ class NetworkManager:
                     pre_sock.close()
 
                 self.client.connect()
-                
+
                 if hasattr(self.client, "sock") and self.client.sock is not None:
                     self.client.sock.settimeout(5.0)
 
@@ -324,7 +420,7 @@ class NetworkManager:
                 self.reconnects += 1
                 self.failed_attempts = 0
                 self.current_backoff = initial_backoff_secs
-                
+
                 if self.last_disconnect_reason:
                     # Overload the global last_reset_reason with the disconnect cause
                     last_reset_reason = self.last_disconnect_reason
@@ -332,17 +428,19 @@ class NetworkManager:
                     self.last_disconnect_reason = ""
                 else:
                     system_status = "nominal - mainloop"
-                    
+
                 flash_led(40)
                 return True
             except (OSError, MQTTException) as err:
                 if not self.last_disconnect_reason:
-                    self.last_disconnect_reason = f"Connect: {self._parse_oserror(err)}"
+                    self.last_disconnect_reason = (
+                        f"Connect: {self._parse_oserror(err)}"
+                    )
                 print(f"MQTT connection failed: {err}")
                 self.client = None
 
         self.failed_attempts += 1
-        
+
         if not system_status.startswith("recovered"):
             system_status = (
                 f"error - network ({self.failed_attempts}/{max_failed_attempts})"
@@ -383,8 +481,12 @@ class NetworkManager:
             flash_led(15)
             return True
         except (OSError, MQTTException) as err:
-            self.last_disconnect_reason = f"Publish Drop: {self._parse_oserror(err)}"
-            print(f"MQTT publish error to {topic}: {self.last_disconnect_reason}")
+            self.last_disconnect_reason = (
+                f"Publish Drop: {self._parse_oserror(err)}"
+            )
+            print(
+                f"MQTT publish error to {topic}: {self.last_disconnect_reason}"
+            )
             self.client = None
             return False
 
@@ -394,11 +496,13 @@ class NetworkManager:
             try:
                 self.client.check_msg()
             except (OSError, MQTTException) as err:
-                self.last_disconnect_reason = f"Receive Drop: {self._parse_oserror(err)}"
+                self.last_disconnect_reason = (
+                    f"Receive Drop: {self._parse_oserror(err)}"
+                )
                 print(f"MQTT check_msg error: {self.last_disconnect_reason}")
                 self.client = None
 
-    async def send_discovery(self, sensors_list: list) -> bool:
+    async def send_discovery(self, sensors_list: list[dict]) -> bool:
         """Send Home Assistant MQTT discovery configuration."""
         global system_status
         try:
@@ -429,47 +533,66 @@ class NetworkManager:
             for s in sensors_list:
                 topic = f"homeassistant/sensor/{s['sensor_id']}_T/config"
                 payload = {
-                    "name": f"{s['sensor_name']} Temp", 
-                    "unique_id": f"{s['sensor_id']}_T", 
+                    "name": f"{s['sensor_name']} Temp",
+                    "unique_id": f"{s['sensor_id']}_T",
                     "state_topic": f"homeassistant/sensor/{s['sensor_id']}/state",
                     "availability": [
                         {"topic": self.master_avail_topic},
-                        {"topic": f"homeassistant/sensor/{s['sensor_id']}/availability"}
+                        {
+                            "topic": f"homeassistant/sensor/{s['sensor_id']}/availability"
+                        },
                     ],
                     "availability_mode": "all",
-                    "unit_of_measurement": "°C", "device_class": "temperature",
-                    "state_class": "measurement", 
+                    "unit_of_measurement": "°C",
+                    "device_class": "temperature",
+                    "state_class": "measurement",
                     "value_template": "{{ value_json.temperature }}",
-                    "device": device_info
+                    "device": device_info,
                 }
                 self.publish(topic, payload)
                 await asyncio.sleep(0.1)
-            
+
             sys_sensors = [
-                ("pico_temp", "Internal CPU Temp", "temperature", "°C", "measurement"),
-                ("rssi", "Signal Strength", "signal_strength", "dBm", "measurement"), 
+                (
+                    "pico_temp",
+                    "Internal CPU Temp",
+                    "temperature",
+                    "°C",
+                    "measurement",
+                ),
+                (
+                    "rssi",
+                    "Signal Strength",
+                    "signal_strength",
+                    "dBm",
+                    "measurement",
+                ),
                 ("uptime", "Uptime", "duration", "s", None),
-                ("version", "Firmware Version", None, None, None), 
+                ("version", "Firmware Version", None, None, None),
                 ("reconnects", "Reconnect Count", None, None, None),
-                ("last_reset", "Last Reset Reason", None, None, None), 
+                ("last_reset", "Last Reset Reason", None, None, None),
                 ("crash_log", "Crash Log", None, None, None),
-                ("status", "System Status", None, None, None)
+                ("status", "System Status", None, None, None),
+                ("roms", "Discovered ROMs", None, None, None),
             ]
-                           
+
             for key, name, d_class, unit, s_class in sys_sensors:
                 topic = f"homeassistant/sensor/{self.client_id}_{key}/config"
                 payload = {
-                    "name": name, 
+                    "name": name,
                     "unique_id": f"{self.client_id}_{key}",
                     "state_topic": f"homeassistant/sensor/{self.client_id}_sys/state",
                     "availability_topic": self.master_avail_topic,
-                    "value_template": f"{{{{ value_json.{key} }}}}", 
+                    "value_template": f"{{{{ value_json.{key} }}}}",
                     "entity_category": "diagnostic",
-                    "device": device_info
+                    "device": device_info,
                 }
-                if d_class: payload["device_class"] = d_class
-                if unit: payload["unit_of_measurement"] = unit
-                if s_class: payload["state_class"] = s_class 
+                if d_class:
+                    payload["device_class"] = d_class
+                if unit:
+                    payload["unit_of_measurement"] = unit
+                if s_class:
+                    payload["state_class"] = s_class
                 self.publish(topic, payload)
                 await asyncio.sleep(0.1)
             return True
@@ -484,12 +607,33 @@ class NetworkManager:
 async def main() -> None:
     global system_status, last_published_status, force_sensor_publish, watchdog, last_crash_log
 
+    init_system()
     watchdog = machine.WDT(timeout=watchdog_timeout_ms)
 
-    sensors_manager = SensorManager(data_pin_num=15, sensor_list=sensor_names)
+    sensors_manager = SensorManager(
+        data_pin_num=15,
+        sensor_list=sensor_names,
+        rom_mapping=sensor_map,
+    )
     network_controller = NetworkManager(
         client_id, secrets.mqttBroker, secrets.mqttUser, secrets.mqttPassword
     )
+
+    def build_sys_data() -> dict:
+        """Assemble current system diagnostic metrics for MQTT publishing."""
+        internal_volts = internal_temp_sensor.read_u16() * (3.3 / 65535)
+        pico_temp_c = round(27 - (internal_volts - 0.706) / 0.001721, 1)
+        return {
+            "pico_temp": pico_temp_c,
+            "rssi": get_rssi(),
+            "uptime": time.time() - system_start_time_secs,
+            "version": app_version,
+            "reconnects": network_controller.reconnects,
+            "last_reset": last_reset_reason,
+            "crash_log": last_crash_log,
+            "status": system_status,
+            "roms": sensors_manager.get_discovered_roms_str(),
+        }
 
     def sub_cb(topic: bytes, msg: bytes) -> None:
         global system_status
@@ -498,27 +642,14 @@ async def main() -> None:
 
         if topic_str == network_controller.ota_cmd_topic:
             if msg_str.upper() == "PRESS":
+                sys_data = build_sys_data()
                 try:
                     system_status = "nominal - ota initiating"
-                    internal_volts = internal_temp_sensor.read_u16() * (3.3 / 65535)
-                    pico_temp_c = round(
-                        27 - (internal_volts - 0.706) / 0.001721, 1
-                    )
-                    sys_data = {
-                        "pico_temp": pico_temp_c,
-                        "rssi": get_rssi(),
-                        "uptime": time.time() - system_start_time_secs,
-                        "version": app_version,
-                        "reconnects": network_controller.reconnects,
-                        "last_reset": last_reset_reason,
-                        "crash_log": last_crash_log,
-                        "status": system_status,
-                    }
-
+                    sys_data["status"] = system_status
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
-                    
+
                     with open("/ota_pending.flag", "w") as f:
                         f.write("pending")
 
@@ -534,7 +665,7 @@ async def main() -> None:
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
-                    
+
                     ugit.pull_all(
                         isconnected=True,
                         ignore=[
@@ -550,28 +681,34 @@ async def main() -> None:
                     try:
                         with open("/ugit_log.txt", "r") as log_file:
                             log_lines = log_file.readlines()
-                            
+
                         updated_files = []
                         for line in log_lines:
                             clean_line = line.strip()
-                            if "updated" in clean_line or "downloaded" in clean_line:
+                            if (
+                                "updated" in clean_line
+                                or "downloaded" in clean_line
+                            ):
                                 parts = clean_line.split(" ")
                                 if parts:
                                     file_name = parts[0].lstrip("/")
                                     if file_name not in updated_files:
                                         updated_files.append(file_name)
-                                        
+
                         if updated_files:
-                            system_status = f"nominal - ota files: {', '.join(updated_files)}"
+                            system_status = (
+                                f"nominal - ota files: {', '.join(updated_files)}"
+                            )
                         else:
                             system_status = "nominal - ota no files changed"
-                            
+
                         sys_data["status"] = system_status
                         network_controller.publish(
-                            f"homeassistant/sensor/{client_id}_sys/state", sys_data
+                            f"homeassistant/sensor/{client_id}_sys/state",
+                            sys_data,
                         )
-                        time.sleep(2)  
-                        
+                        time.sleep(2)
+
                     except OSError:
                         pass
 
@@ -579,13 +716,13 @@ async def main() -> None:
                         os.remove("/ota_pending.flag")
                     except OSError:
                         pass
-                    
+
                     system_status = "nominal - ota complete, rebooting"
                     sys_data["status"] = system_status
                     network_controller.publish(
                         f"homeassistant/sensor/{client_id}_sys/state", sys_data
                     )
-                    time.sleep(1)  
+                    time.sleep(1)
                     machine.reset()
 
                 except Exception as err:
@@ -612,7 +749,9 @@ async def main() -> None:
             watchdog.feed()
         now_secs = time.time()
 
-        if network_controller.client is not None and (now_secs - last_loop_success_secs > 120):
+        if network_controller.client is not None and (
+            now_secs - last_loop_success_secs > 120
+        ):
             system_status = "error - main loop deadlock, forcing reset"
             print(system_status)
             time.sleep(1)
@@ -637,6 +776,42 @@ async def main() -> None:
 
         network_controller.check_messages()
 
+        if now_secs - last_read_time_secs >= sensor_interval_secs:
+            if not system_status.startswith("recovered"):
+                system_status = "nominal - sensor conversion"
+            bus_active = sensors_manager.start_conversion()
+            if not bus_active:
+                for s in sensors_manager.sensors:
+                    if s["last_avail"] != "offline":
+                        network_controller.publish(
+                            f"homeassistant/sensor/{s['sensor_id']}/availability",
+                            "offline",
+                        )
+                        s["last_avail"] = "offline"
+                last_read_time_secs = now_secs
+            else:
+                await asyncio.sleep_ms(750)
+
+                ready_payloads = sensors_manager.read_and_evaluate(
+                    force_publish=force_sensor_publish
+                )
+                force_sensor_publish = False
+
+                for item in ready_payloads:
+                    network_controller.publish(item["topic"], item["payload"])
+
+                last_read_time_secs = time.time()
+
+                offline_names = [
+                    s["sensor_name"]
+                    for s in sensors_manager.sensors
+                    if s["last_avail"] == "offline"
+                ]
+                if offline_names:
+                    system_status = f"error - missing: {','.join(offline_names)}"
+                else:
+                    system_status = "nominal - mainloop"
+
         force_heartbeat = (
             now_secs - last_heartbeat_time_secs >= heartbeat_interval_secs
         )
@@ -645,21 +820,7 @@ async def main() -> None:
         if (
             force_heartbeat or status_changed
         ) and network_controller.client is not None:
-            internal_volts = internal_temp_sensor.read_u16() * (3.3 / 65535)
-            pico_temp_c = round(
-                27 - (internal_volts - 0.706) / 0.001721, 1
-            )
-
-            sys_data = {
-                "pico_temp": pico_temp_c,
-                "rssi": get_rssi(),
-                "uptime": time.time() - system_start_time_secs,
-                "version": app_version,
-                "reconnects": network_controller.reconnects,
-                "last_reset": last_reset_reason,
-                "crash_log": last_crash_log,
-                "status": system_status,
-            }
+            sys_data = build_sys_data()
             if network_controller.publish(
                 f"homeassistant/sensor/{client_id}_sys/state", sys_data
             ):
@@ -669,9 +830,9 @@ async def main() -> None:
                         last_crash_log = ""
                     except OSError:
                         pass
-                
+
                 last_published_status = system_status
-                
+
                 if system_status.startswith("recovered"):
                     system_status = "nominal - mainloop"
                     await asyncio.sleep(2)  # Give HA time to process the logbook entry
@@ -679,33 +840,6 @@ async def main() -> None:
             if force_heartbeat:
                 force_sensor_publish = True
                 last_heartbeat_time_secs = now_secs
-
-        if now_secs - last_read_time_secs >= sensor_interval_secs:
-            if not system_status.startswith("recovered"):
-                system_status = "nominal - sensor conversion"
-            bus_active = sensors_manager.start_conversion()
-            if not bus_active:
-                for s in sensors_manager.sensors:
-                    if s['last_avail'] != 'offline':
-                        network_controller.publish(f"homeassistant/sensor/{s['sensor_id']}/availability", "offline")
-                        s['last_avail'] = 'offline'
-                last_read_time_secs = now_secs 
-            else:
-                await asyncio.sleep_ms(750)
-                
-                ready_payloads = sensors_manager.read_and_evaluate(force_publish=force_sensor_publish)
-                force_sensor_publish = False 
-                
-                for item in ready_payloads:
-                    network_controller.publish(item['topic'], item['payload'])
-                    
-                last_read_time_secs = time.time()
-                
-                offline_names = [s['sensor_name'] for s in sensors_manager.sensors if s['last_avail'] == 'offline']
-                if offline_names:
-                    system_status = f"error - missing: {','.join(offline_names)}"
-                else:
-                    system_status = "nominal - mainloop"
 
         last_loop_success_secs = now_secs
 
